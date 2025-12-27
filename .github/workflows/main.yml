@@ -1,83 +1,91 @@
-name: Nexus Core - SM8650 One-Click Builder
+name: Nexus One-Click Kernel Builder (Aria2 Method)
 on:
-  workflow_dispatch: # 手动触发
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-22.04
-    # 授予 Actions 读取和写入权限
-    permissions:
-      contents: write
-
     steps:
-      - name: 1. 极致磁盘空间清理
+      - name: 1. 极致磁盘清理
         run: |
           sudo docker rmi $(docker images -q)
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost /var/lib/apt/lists/*
           sudo apt-get clean
-          df -h
 
-      - name: 2. 安装编译依赖
+      - name: 2. 安装环境依赖
         run: |
           sudo apt-get update
-          sudo apt-get install -y git-core gnupg flex bison build-essential zip curl zlib1g-dev libncurses5-dev libssl-dev python3-pip
+          sudo apt-get install -y git-core gnupg flex bison build-essential zip curl zlib1g-dev libncurses5-dev libssl-dev python3-pip aria2
+          # 安装 Repo（作为备用路径引用）
           mkdir ~/bin
           curl https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
           chmod a+x ~/bin/repo
           echo "PATH=$PATH:$HOME/bin" >> $GITHUB_ENV
 
-      - name: 3. 源码同步 (强制 HTTPS)
+      - name: 3. 极速重组源码树 (Aria2 + Manual Link)
         run: |
-          git config --global user.email "bot@nexus.com"
-          git config --global user.name "Nexus-Builder"
-          # 核心修复：清除所有干扰配置，强制 HTTPS
-          git config --global --unset-all url.https://github.com/.insteadOf || true
-          git config --global url."https://github.com/".insteadOf "git@github.com:"
-          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
-
-          mkdir nexus_project && cd nexus_project
-          # 初始化清单
-          repo init -u https://github.com/OnePlusOSS/android_kernel_manifest_oneplus_sm8650 -b oneplus/sm8650_v_15.0.0_pad_pro --depth=1
-          # 同步核心仓库
-          repo sync -j$(nproc) --current-branch --no-tags --no-clone-bundle --force-sync
+          mkdir -p kernel_workspace && cd kernel_workspace
           
-          # 空间防御：物理删除 .repo 文件夹以腾出 15GB+ 空间给 Bazel 缓存
-          rm -rf .repo
+          echo "正在多线程下载核心 Common 源码..."
+          aria2c -s16 -x16 -k1M https://github.com/OnePlusOSS/android_kernel_common_oneplus_sm8650/archive/refs/heads/oneplus/sm8650_v_15.0.0_pad_pro.zip -o common.zip
+          unzip -q common.zip && mv android_kernel_common_oneplus_sm8650-* common && rm common.zip
+
+          echo "正在多线程下载 MSM 内核驱动..."
+          aria2c -s16 -x16 -k1M https://github.com/OnePlusOSS/android_kernel_oneplus_sm8650/archive/refs/heads/oneplus/sm8650_v_15.0.0_pad_pro.zip -o msm.zip
+          unzip -q msm.zip && mv android_kernel_oneplus_sm8650-* msm-kernel && rm msm.zip
+
+          echo "正在拉取编译脚本与工具链..."
+          git clone --depth=1 -b oneplus/sm8650_v_15.0.0_pad_pro https://github.com/OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_sm8650 build_tools
+          
+          # 物理组装 Manifest 要求的结构
+          mkdir -p kernel_platform
+          mv common kernel_platform/
+          mv msm-kernel kernel_platform/
+          mv build_tools/* kernel_platform/
+          
+          # 关键软链接：Bazel 寻找路径必需
+          cd kernel_platform
+          ln -s . WORKSPACE
+          ln -s msm-kernel/build_with_bazel.py build_with_bazel.py
           df -h
 
-      - name: 4. Bazel 内核编译 (GKI Image)
+      - name: 4. 执行物理锁定/代码修改 (可选测试)
         run: |
-          cd nexus_project
-          # 执行一加专用的 Bazel 编译脚本
-          # 如果内存不足，可以尝试添加 --jobs=4 限制并发
-          python3 kernel_platform/build_with_bazel.py -t sm8650 gki
+          # 如果此时你有具体的 C 代码修改，可以在这里用 sed 注入
+          echo "源码树重组完毕，准备开始编译..."
+
+      - name: 5. Bazel 编译内核 (GKI Image)
+        run: |
+          cd kernel_workspace/kernel_platform
+          # 针对 SM8650 的 Bazel 构建目标
+          # 如果 GitHub 内存溢出，可尝试限制并发: --jobs=4
+          python3 build_with_bazel.py -t sm8650 gki
           
-          # 验证产物是否存在
           if [ -f "out/msm-kernel-sm8650-gki/dist/Image" ]; then
-            echo "CHECK_IMAGE=true" >> $GITHUB_ENV
+            echo "IMAGE_READY=true" >> $GITHUB_ENV
           else
-            echo "Kernel Image not found!" && exit 1
+            echo "编译失败：未找到内核镜像产物" && exit 1
           fi
 
-      - name: 5. 封装 AnyKernel3 刷机包
-        if: env.CHECK_IMAGE == 'true'
+      - name: 6. 自动封装 AnyKernel3
+        if: env.IMAGE_READY == 'true'
         run: |
           git clone https://github.com/osm0sis/AnyKernel3 nexus_ak3
           cd nexus_ak3
-          # 修改 anykernel.sh 配置：适配一加 Pad Pro 分区
+          # 适配一加 Pad Pro 的 init_boot 分区
           sed -i 's/block=\/dev\/block\/tdb/block=\/dev\/block\/by-name\/init_boot/g' anykernel.sh
           sed -i 's/is_slot_device=0/is_slot_device=1/g' anykernel.sh
           
-          # 注入内核 Image
-          cp ../nexus_project/out/msm-kernel-sm8650-gki/dist/Image .
+          # 放入编译好的 Image
+          cp ../kernel_workspace/kernel_platform/out/msm-kernel-sm8650-gki/dist/Image .
           
-          # 清理并打包
+          # 封包
           rm -rf .git README.md
-          zip -r9 ../Nexus_Kernel_SM8650_AnyKernel3.zip *
+          zip -r9 ../Nexus_Kernel_Update.zip *
 
-      - name: 6. 上传产物
+      - name: 7. 上传最终刷机包
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: Nexus-Kernel-Flashable
-          path: Nexus_Kernel_SM8650_AnyKernel3.zip
+          name: Oneplus-PadPro-Kernel
+          path: Nexus_Kernel_Update.zip
