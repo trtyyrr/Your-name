@@ -1,4 +1,4 @@
-name: Nexus SM8650 One-Click Builder (Stable)
+name: Nexus SM8650 One-Click Builder (Bazel Fixed)
 on:
   workflow_dispatch:
 
@@ -22,53 +22,53 @@ jobs:
           chmod a+x ~/bin/repo
           echo "PATH=$PATH:$HOME/bin" >> $GITHUB_ENV
 
-      - name: 3. 极速重组源码树 (ZIP 绕过认证)
+      - name: 3. 极速重组源码树 (补全 Bazel 二进制)
         run: |
           mkdir -p kernel_workspace && cd kernel_workspace
           
-          echo "正在多线程下载核心 Common 源码..."
+          echo "正在多线程下载核心源码..."
           aria2c -s16 -x16 -k1M https://github.com/OnePlusOSS/android_kernel_common_oneplus_sm8650/archive/refs/heads/oneplus/sm8650_v_15.0.0_pad_pro.zip -o common.zip
           unzip -q common.zip && mv android_kernel_common_oneplus_sm8650-* common && rm common.zip
 
-          echo "正在多线程下载 MSM 内核驱动..."
           aria2c -s16 -x16 -k1M https://github.com/OnePlusOSS/android_kernel_oneplus_sm8650/archive/refs/heads/oneplus/sm8650_v_15.0.0_pad_pro.zip -o msm.zip
           unzip -q msm.zip && mv android_kernel_oneplus_sm8650-* msm-kernel && rm msm.zip
 
-          echo "正在拉取编译脚本与工具链..."
           git clone --depth=1 -b oneplus/sm8650_v_15.0.0_pad_pro https://github.com/OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_sm8650 build_tools
           
-          # 物理组装 Manifest 要求的层级结构
-          mkdir -p kernel_platform
+          # 物理组装 Manifest 层级
+          mkdir -p kernel_platform/tools
           mv common kernel_platform/
           mv msm-kernel kernel_platform/
           mv build_tools/* kernel_platform/
           
-          # 建立 Bazel 必需的软链接
+          # 【修复】手动补全脚本所需的 Bazel 二进制文件
+          echo "正在下载 Bazel 编译引擎..."
+          curl -Lo kernel_platform/tools/bazel https://github.com/bazelbuild/bazel/releases/download/6.3.2/bazel-6.3.2-linux-x86_64
+          chmod +x kernel_platform/tools/bazel
+          
+          # 建立必需的软链接
           cd kernel_platform
           ln -s . WORKSPACE
           ln -s msm-kernel/build_with_bazel.py build_with_bazel.py
           df -h
 
-      - name: 4. 修复一加脚本 Bug (AttributeError Patch)
+      - name: 4. 修复脚本 Bug (AttributeError Patch)
         run: |
-          # 进入脚本所在目录
           cd kernel_workspace/kernel_platform/msm-kernel
-          # 物理补丁：在 BazelBuilder 类初始化时强行注入 process_list 变量
-          # 解决 AttributeError: 'BazelBuilder' object has no attribute 'process_list'
+          # 物理注入补丁，解决 process_list 缺失导致的崩溃
           sed -i '/def __init__(self/a \        self.process_list = []' build_with_bazel.py
-          echo "补丁应用成功：已初始化 process_list"
+          echo "补丁已应用"
 
       - name: 5. 执行 Bazel 编译 (GKI Image)
         run: |
           cd kernel_workspace/kernel_platform
-          # 执行编译。由于 GitHub Actions 内存有限，强制限制并发为 4
-          # 如果仍然内存溢出，可将 --jobs 改为 2
+          # 执行编译。由于 GitHub Actions 内存限制，强制限制并发以防 OOM
           python3 build_with_bazel.py -t sm8650 gki --jobs=4
           
           if [ -f "out/msm-kernel-sm8650-gki/dist/Image" ]; then
             echo "IMAGE_READY=true" >> $GITHUB_ENV
           else
-            echo "编译失败：未找到产物 Image" && exit 1
+            echo "编译失败：产物未生成" && exit 1
           fi
 
       - name: 6. 封装 AnyKernel3
@@ -76,20 +76,20 @@ jobs:
         run: |
           git clone https://github.com/osm0sis/AnyKernel3 nexus_ak3
           cd nexus_ak3
-          # 修改 AK3 脚本以适配一加 Pad Pro (init_boot 分区)
+          # 适配一加 Pad Pro (init_boot 分区)
           sed -i 's/block=\/dev\/block\/tdb/block=\/dev\/block\/by-name\/init_boot/g' anykernel.sh
           sed -i 's/is_slot_device=0/is_slot_device=1/g' anykernel.sh
           
-          # 物理注入内核镜像
+          # 复制内核镜像
           cp ../kernel_workspace/kernel_platform/out/msm-kernel-sm8650-gki/dist/Image .
           
-          # 打包 ZIP
+          # 清理并打包
           rm -rf .git README.md
-          zip -r9 ../Nexus_Kernel_SM8650_Update.zip *
+          zip -r9 ../Nexus_Kernel_SM8650_Flashable.zip *
 
-      - name: 7. 上传最终刷机包
+      - name: 7. 上传产物
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: Nexus-OnePlus-PadPro-Kernel
-          path: Nexus_Kernel_SM8650_Update.zip
+          name: Oneplus-PadPro-Kernel-Update
+          path: Nexus_Kernel_SM8650_Flashable.zip
