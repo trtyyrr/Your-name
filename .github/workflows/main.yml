@@ -1,6 +1,6 @@
 name: Nexus Core - One-Click Kernel Builder
 on:
-  workflow_dispatch: # 点击按钮即可开始
+  workflow_dispatch:
 
 jobs:
   build:
@@ -21,38 +21,47 @@ jobs:
           chmod a+x ~/bin/repo
           echo "PATH=$PATH:$HOME/bin" >> $GITHUB_ENV
 
-      - name: 3. 同步一加 SM8650 源码
+      - name: 3. 配置身份验证并同步源码
         run: |
+          # 核心修复：强制 Git 使用 HTTPS 并注入 GitHub 令牌
           git config --global user.email "bot@nexus.com"
           git config --global user.name "Nexus-Builder"
+          git config --global url."https://github.com/".insteadOf "git@github.com:"
+          git config --global url."https://android.googlesource.com/".insteadOf "git://android.googlesource.com/"
+          
+          # 使用当前的 GITHUB_TOKEN 授权
+          git config --global url."https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/".insteadOf "https://github.com/"
+
           mkdir nexus_project && cd nexus_project
-          # 使用深度为 1 节省空间
+          
+          # 初始化：--depth=1 减少数据量并防止拉取过旧的分支触发验证
           repo init -u https://github.com/OnePlusOSS/android_kernel_manifest_oneplus_sm8650 -b oneplus/sm8650_v_15.0.0_pad_pro --depth=1
-          repo sync -j$(nproc) --current-branch --no-tags --force-sync
+          
+          # 同步：增加 --no-clone-bundle 避免某些 CDN 导致的认证错误
+          repo sync -j$(nproc) --current-branch --no-tags --no-clone-bundle --force-sync
+          
+          # 释放空间：同步完后删掉隐藏的 .repo 文件夹，否则 Bazel 编译空间绝对不够
+          rm -rf .repo
           df -h
 
       - name: 4. 执行 Bazel 内核编译
         run: |
           cd nexus_project
-          # 调用清单中的 Bazel 构建脚本，目标 sm8650 GKI
           python3 kernel_platform/build_with_bazel.py -t sm8650 gki
-          # 验证 Image 是否生成
-          ls -l out/msm-kernel-sm8650-gki/dist/Image
 
       - name: 5. 整合 AnyKernel3 并打包
+        if: success()
         run: |
           git clone https://github.com/osm0sis/AnyKernel3 nexus_ak3
           cd nexus_ak3
-          # 配置 anykernel.sh (物理路径针对一加 Pad Pro)
           sed -i 's/block=\/dev\/block\/tdb/block=\/dev\/block\/by-name\/init_boot/g' anykernel.sh
           sed -i 's/is_slot_device=0/is_slot_device=1/g' anykernel.sh
-          # 将编译好的内核物理放入 AK3 目录
           cp ../nexus_project/out/msm-kernel-sm8650-gki/dist/Image .
-          # 清理无关文件并打包
           rm -rf .git README.md
           zip -r9 ../Nexus_Kernel_SM8650.zip *
 
       - name: 6. 上传最终刷机包
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: Nexus_Kernel_Flashable
