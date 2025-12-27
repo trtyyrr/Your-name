@@ -54,12 +54,21 @@ jobs:
           # 如果此时你有具体的 C 代码修改，可以在这里用 sed 注入
           echo "源码树重组完毕，准备开始编译..."
 
-      - name: 5. Bazel 编译内核 (GKI Image)
+            - name: 5. 修复脚本 Bug 并执行编译
         run: |
-          cd kernel_workspace/kernel_platform
-          # 针对 SM8650 的 Bazel 构建目标
-          # 如果 GitHub 内存溢出，可尝试限制并发: --jobs=4
-          python3 build_with_bazel.py -t sm8650 gki
+          cd kernel_workspace/kernel_platform/msm-kernel
+          
+          # 物理补丁：在一加脚本的构造函数中强行初始化 process_list，防止报错
+          # 这个 sed 命令会在 BazelBuilder 的 __init__ 方法中插入缺失的属性
+          sed -i '/def __init__(self/a \        self.process_list = []' build_with_bazel.py
+          
+          # 检查补丁是否成功
+          grep "self.process_list = \[\]" build_with_bazel.py
+          
+          cd ..
+          # 针对 SM8650 的 Bazel 构建
+          # 添加 --jobs 限制以防止内存溢出导致脚本异常崩溃
+          python3 build_with_bazel.py -t sm8650 gki --jobs=4
           
           if [ -f "out/msm-kernel-sm8650-gki/dist/Image" ]; then
             echo "IMAGE_READY=true" >> $GITHUB_ENV
