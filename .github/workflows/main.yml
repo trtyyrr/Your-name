@@ -18,25 +18,57 @@ jobs:
         with:
           targets: aarch64-linux-android
 
-      - name: Install NDK & Toolchain
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y zip
-          echo "NDK_HOME=${ANDROID_NDK_LATEST_HOME}" >> $GITHUB_ENV
-
       - name: Build Rust Engine
         run: |
-          # 动态创建 Cargo.toml 如果不存在
-          if [ ! -f Cargo.toml ]; then
-            echo '[package]' > Cargo.toml
-            echo 'name = "nexus_meta_engine"' >> Cargo.toml
-            echo 'version = "0.1.0"' >> Cargo.toml
-            echo 'edition = "2021"' >> Cargo.toml
-            echo '[dependencies]' >> Cargo.toml
-            echo 'nix = "0.27"' >> Cargo.toml
-          fi
+          # 1. 创建源码目录
+          mkdir -p src
           
-          # 使用 cargo-ndk 或直接指定 linker 编译
+          # 2. 写入 Rust 核心逻辑
+          cat <<EOF > src/main.rs
+          use nix::mount::{mount, MsFlags};
+          use std::fs;
+          use std::path::Path;
+
+          fn main() -> Result<(), Box<dyn std::error::Error>> {
+              let modules_root = Path::new("/data/adb/modules");
+              if !modules_root.exists() { return Ok(()); }
+              for entry in fs::read_dir(modules_root)? {
+                  let entry = entry?;
+                  let mod_path = entry.path();
+                  if mod_path.join("disable").exists() || mod_path.join("skip_mount").exists() { continue; }
+                  let system_src = mod_path.join("system");
+                  if system_src.is_dir() {
+                      // KSU 挂载标准：source 必须为 "KSU"
+                      let _ = mount(Some(&system_src), "/system", None::<&str>, MsFlags::MS_BIND | MsFlags::MS_REC, Some("KSU"));
+                  }
+              }
+              Ok(())
+          }
+          EOF
+
+          # 3. 写入完整的 Cargo.toml
+          cat <<EOF > Cargo.toml
+          [package]
+          name = "nexus_meta_engine"
+          version = "0.1.0"
+          edition = "2021"
+
+          [dependencies]
+          nix = "0.27"
+
+          [[bin]]
+          name = "nexus_meta_engine"
+          path = "src/main.rs"
+
+          [profile.release]
+          strip = true      # 自动精简体积
+          opt-level = "z"   # 优化大小
+          lto = true        # 链接时优化
+          EOF
+          
+          # 4. 执行编译
+          # 环境变量确保使用 NDK 的 Clang 链接器
+          export PATH=$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH
           cargo build --release --target aarch64-linux-android
         env:
           CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER: aarch64-linux-android34-clang
@@ -46,28 +78,28 @@ jobs:
           mkdir -p build/bin
           mkdir -p build/META-INF/com/google/android
           
-          # 拷贝编译产物
+          # 拷贝编译出的二进制文件
           cp target/aarch64-linux-android/release/nexus_meta_engine build/bin/
           
-          # 写入 module.prop
+          # 写入元模块标识 (Metamodule Identifier)
           cat <<EOF > build/module.prop
           id=nexus_meta_rust
           name=Nexus Meta-Engine (RS)
           version=v1.0
           versionCode=1
           author=Gemini
-          description=High-performance Rust-based Metamodule for KernelSU.
+          description=Infrastructure Metamodule written in Rust for KernelSU.
           metamodule=1
           EOF
 
-          # 写入 metamount.sh 钩子
+          # 写入元挂载钩子脚本
           cat <<EOF > build/metamount.sh
           #!/system/bin/sh
           MODDIR="\${0%/*}"
           \$MODDIR/bin/nexus_meta_engine
           EOF
 
-          # 写入安装脚本
+          # 写入通用的更新脚本
           cat <<EOF > build/META-INF/com/google/android/update-binary
           #!/sbin/sh
           ZIPFILE="\$3"
