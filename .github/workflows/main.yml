@@ -1,4 +1,4 @@
-name: Nexus SM8650 Ultimate Builder
+name: Nexus SM8650 Stable Kbuild (No-Bazel)
 on:
   workflow_dispatch:
 
@@ -6,92 +6,78 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: 1. 环境初始化与极速下载
+      - name: 1. 环境初始化
         run: |
-          sudo apt update && sudo apt install -y --no-install-recommends binutils python-is-python3 libssl-dev libelf-dev aria2 zip unzip ccache
-          
-          # 直接在当前工作目录操作，不再创建多层嵌套
-          echo "正在下载核心源码 (Common)..."
+          sudo apt update && sudo apt install -y --no-install-recommends binutils python-is-python3 libssl-dev libelf-dev aria2 zip unzip ccache bc libncurses-dev flex bison
+          mkdir -p kernel_workspace && cd kernel_workspace
+
+          echo "正在下载 Common 核心源码..."
           aria2c -s16 -x16 -k1M https://github.com/cctv18/android_kernel_common_oneplus_sm8650/archive/refs/heads/oneplus/sm8650_v_15.0.0_oneplus12_6.1.118.zip -o common.zip
           unzip -q common.zip && mv android_kernel_common_oneplus_sm8650-* common && rm common.zip
 
-          echo "正在下载驱动源码 (MSM-Kernel)..."
-          aria2c -s16 -x16 -k1M https://github.com/OnePlusOSS/android_kernel_oneplus_sm8650/archive/refs/heads/oneplus/sm8650_v_15.0.0_pad_pro.zip -o msm.zip
-          unzip -q msm.zip && mv android_kernel_oneplus_sm8650-* msm-kernel && rm msm.zip
-
-          echo "正在下载工具链 (Clang20)..."
+          echo "正在下载工具链 (Clang 20)..."
           mkdir -p clang20
           aria2c -s16 -x16 -k1M https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang20-r547379/clang-r547379.zip -o clang.zip
           unzip -q clang.zip -d clang20 && rm clang.zip
 
-      - name: 2. 物理路径全覆盖对齐 (解决所有 Bazel 找不到的问题)
+      - name: 2. 源码预处理
         run: |
-          # 1. 建立物理 tools 目录并下载 Bazel
-          mkdir -p tools
-          curl -Lo tools/bazel https://github.com/bazelbuild/bazel/releases/download/6.3.2/bazel-6.3.2-linux-x86_64
-          chmod +x tools/bazel
+          cd kernel_workspace/common
+          echo "去除 ABI 保护..."
+          rm android/abi_gki_protected_exports_* || true
           
-          # 2. 建立根目录 WORKSPACE
-          echo 'workspace(name = "kernel_platform")' > WORKSPACE
-          
-          # 3. 建立脚本预期的 build 文件夹
-          mkdir -p build
-          [ -f "msm-kernel/msm_kernel_extensions.bzl" ] && cp msm-kernel/msm_kernel_extensions.bzl build/
-          
-          # 4. 【关键步骤】将所有内容放入脚本要求的 kernel_platform 虚拟层级
-          mkdir -p kernel_platform
-          ln -sf $(pwd)/common kernel_platform/common
-          ln -sf $(pwd)/msm-kernel kernel_platform/msm-kernel
-          ln -sf $(pwd)/tools kernel_platform/tools
-          ln -sf $(pwd)/WORKSPACE kernel_platform/WORKSPACE
-          ln -sf $(pwd)/build kernel_platform/build
-          
-          # 5. 复制脚本到根目录
-          cp msm-kernel/build_with_bazel.py .
-          
-          echo "检查物理路径对齐情况："
-          ls -l tools/bazel
-          ls -l kernel_platform/tools/bazel
+          echo "修正版本后缀..."
+          sed -i 's/ -dirty//g' scripts/setlocalversion
 
-      - name: 3. 破解 ABI 限制与脚本补丁
+      - name: 3. 执行传统 Makefile 编译 (GKI 架构)
         run: |
-          # 修复脚本内部变量
-          sed -i '/def __init__(self/a \        self.process_list = []' build_with_bazel.py
+          cd kernel_workspace/common
           
-          # 去除 ABI 保护
-          rm common/android/abi_gki_protected_exports_* || true
+          # 设置工具链路径
+          CLANG_PATH=$(pwd)/../clang20/bin
+          export PATH="$CLANG_PATH:$PATH"
           
-          # 去除 -dirty 后缀
-          for f in common/scripts/setlocalversion; do
-            sed -i 's/ -dirty//g' "$f"
-          done
+          # 定义编译参数
+          MAKE_ARGS="
+            ARCH=arm64 \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
+            CLANG_TRIPLE=aarch64-linux-gnu-
+          "
+          
+          echo "生成默认配置 (gki_defconfig)..."
+          make $MAKE_ARGS gki_defconfig
+          
+          echo "开始核心编译 (仅编译内核镜像)..."
+          # 限制 jobs 为 4，防止 GitHub Actions 内存溢出
+          make $MAKE_ARGS -j4 Image
 
-      - name: 4. 执行核心编译 (SM8650 GKI)
+      - name: 4. 提取产物并封装 AnyKernel3
         run: |
-          # 环境变量
-          export PATH=$(pwd)/clang20/bin:$PATH
-          
-          # 强制指定在当前目录运行，并限制 jobs 数量
-          # 如果这里报错 Exit Code 1，请查看输出中的 ERROR 信息
-          python3 build_with_bazel.py -t sm8650 gki --jobs=2
-
-      - name: 5. 提取产物并封装 AnyKernel3
-        run: |
+          cd kernel_workspace
           git clone https://github.com/osm0sis/AnyKernel3 nexus_ak3
           cd nexus_ak3
+          
+          # 适配一加 Pad Pro 分区
           sed -i 's/block=\/dev\/block\/tdb/block=\/dev\/block\/by-name\/init_boot/g' anykernel.sh
           sed -i 's/is_slot_device=0/is_slot_device=1/g' anykernel.sh
           
-          IMAGE=$(find ../out -name Image -type f | head -n 1)
-          if [ -f "$IMAGE" ]; then
-            cp "$IMAGE" .
-            zip -r9 ../Nexus_Kernel_SM8650_Stable.zip *
+          # 寻找编译好的 Image
+          # 传统编译产物在 arch/arm64/boot/Image
+          if [ -f "../common/arch/arm64/boot/Image" ]; then
+            cp "../common/arch/arm64/boot/Image" .
+            zip -r9 ../Nexus_Stable_Kernel.zip *
+            echo "IMAGE_READY=true" >> $GITHUB_ENV
           else
-            echo "错误：未找到编译生成的内核镜像 Image" && exit 1
+            echo "编译失败：未在 arch/arm64/boot/ 下找到 Image"
+            exit 1
           fi
 
-      - name: 6. 上传刷机包
+      - name: 5. 上传刷机包
+        if: env.IMAGE_READY == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: Nexus-Kernel-SM8650
-          path: Nexus_Kernel_SM8650_Stable.zip
+          name: Nexus-Kbuild-Kernel
+          path: Nexus_Stable_Kernel.zip
