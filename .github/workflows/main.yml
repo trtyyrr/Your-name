@@ -1,4 +1,4 @@
-name: Nexus SM8650 One-Click Builder (Symlink Fixed)
+name: Nexus SM8650 One-Click Builder (Workspace Fixed)
 on:
   workflow_dispatch:
 
@@ -22,9 +22,10 @@ jobs:
           chmod a+x ~/bin/repo
           echo "PATH=$PATH:$HOME/bin" >> $GITHUB_ENV
 
-      - name: 3. 极速重组源码树 (物理修复目录结构)
+      - name: 3. 极速重组源码树 (强制物理结构)
         run: |
-          mkdir -p kernel_workspace && cd kernel_workspace
+          # 创建统一的工作根目录
+          mkdir -p kernel_platform && cd kernel_platform
           
           echo "正在多线程下载核心源码..."
           aria2c -s16 -x16 -k1M https://github.com/OnePlusOSS/android_kernel_common_oneplus_sm8650/archive/refs/heads/oneplus/sm8650_v_15.0.0_pad_pro.zip -o common.zip
@@ -34,46 +35,44 @@ jobs:
           unzip -q msm.zip && mv android_kernel_oneplus_sm8650-* msm-kernel && rm msm.zip
 
           git clone --depth=1 -b oneplus/sm8650_v_15.0.0_pad_pro https://github.com/OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_sm8650 build_tools
+          cp -r build_tools/* . && rm -rf build_tools
           
-          # 物理组装 Manifest 层级
-          mkdir -p kernel_platform/tools
-          mkdir -p kernel_platform/build # 提前创建 build 目录，防止脚本创建软链接失败
+          # 1. 物理补全 Bazel 二进制
+          mkdir -p tools
+          curl -Lo tools/bazel https://github.com/bazelbuild/bazel/releases/download/6.3.2/bazel-6.3.2-linux-x86_64
+          chmod +x tools/bazel
           
-          mv common kernel_platform/
-          mv msm-kernel kernel_platform/
-          mv build_tools/* kernel_platform/
+          # 2. 物理修复脚本要求的构建目录
+          mkdir -p build
+          [ -f "msm-kernel/msm_kernel_extensions.bzl" ] && cp msm-kernel/msm_kernel_extensions.bzl build/
+          # 伪造 bootloader 相关文件，防止脚本因找不到 abl_extensions 而崩溃
+          mkdir -p bootable/bootloader/edk2
+          touch bootable/bootloader/edk2/abl_extensions.bzl
           
-          # 下载 Bazel 二进制
-          curl -Lo kernel_platform/tools/bazel https://github.com/bazelbuild/bazel/releases/download/6.3.2/bazel-6.3.2-linux-x86_64
-          chmod +x kernel_platform/tools/bazel
+          # 3. 【核心】创建物理 WORKSPACE 文件，而不是软链接
+          # 写入基本的 Bazel 工作空间声明
+          echo 'workspace(name = "kernel_platform")' > WORKSPACE
           
-          # 建立必需的软链接
-          cd kernel_platform
-          ln -sf . WORKSPACE
+          # 4. 建立项目入口链接
           ln -sf msm-kernel/build_with_bazel.py build_with_bazel.py
           
-          # 【核心修复】手动物理修复脚本报错的软链接
-          # 脚本原本想在 build/ 下找 msm_kernel_extensions.bzl，我们直接给它放过去
-          if [ -f "msm-kernel/msm_kernel_extensions.bzl" ]; then
-            cp msm-kernel/msm_kernel_extensions.bzl build/
-          fi
-          
-          echo "当前目录结构验证："
+          echo "目录结构最终验证："
           ls -F
-          ls -F build/
+          [ -f "WORKSPACE" ] && echo "WORKSPACE 文件已物理存在"
 
       - name: 4. 修复脚本 Bug (AttributeError Patch)
         run: |
-          cd kernel_workspace/kernel_platform/msm-kernel
-          # 物理注入 process_list 变量补丁
+          # 补丁：修复 BazelBuilder 初始化
+          cd kernel_platform/msm-kernel
           sed -i '/def __init__(self/a \        self.process_list = []' build_with_bazel.py
-          echo "补丁已应用"
+          # 额外修复：如果脚本尝试在 build/ 建立软链接报错，强行跳过
+          sed -i 's/os.symlink(def_src, ext_path)/pass/g' build_with_bazel.py
 
       - name: 5. 执行 Bazel 编译 (限制并发)
         run: |
-          cd kernel_workspace/kernel_platform
-          # 针对 SM8650 GKI
-          # 使用 --jobs=2 极其重要，防止内存溢出
+          cd kernel_platform
+          # 注入环境变量，强制 Bazel 识别当前目录
+          export BAZEL_BIN="./tools/bazel"
           python3 build_with_bazel.py -t sm8650 gki --jobs=2
           
           if [ -f "out/msm-kernel-sm8650-gki/dist/Image" ]; then
@@ -90,7 +89,7 @@ jobs:
           cd nexus_ak3
           sed -i 's/block=\/dev\/block\/tdb/block=\/dev\/block\/by-name\/init_boot/g' anykernel.sh
           sed -i 's/is_slot_device=0/is_slot_device=1/g' anykernel.sh
-          cp ../kernel_workspace/kernel_platform/out/msm-kernel-sm8650-gki/dist/Image .
+          cp ../kernel_platform/out/msm-kernel-sm8650-gki/dist/Image .
           rm -rf .git README.md
           zip -r9 ../Nexus_Kernel_SM8650_Flashable.zip *
 
