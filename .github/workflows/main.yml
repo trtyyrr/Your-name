@@ -1,4 +1,4 @@
-name: Build Full Engineering KSU Metamodule
+name: Build Nexus Meta with WebUI
 
 on:
   push:
@@ -25,25 +25,21 @@ jobs:
           use nix::mount::{mount, MsFlags};
           use std::fs;
           use std::path::Path;
-
           fn main() -> Result<(), Box<dyn std::error::Error>> {
               let modules_root = Path::new("/data/adb/modules");
               if !modules_root.exists() { return Ok(()); }
-              println!("[Nexus] 执行元挂载中...");
               for entry in fs::read_dir(modules_root)? {
                   let entry = entry?;
                   let mod_path = entry.path();
                   if mod_path.join("disable").exists() || mod_path.join("skip_mount").exists() { continue; }
                   let system_src = mod_path.join("system");
                   if system_src.is_dir() {
-                      // 严格遵守 KSU source=KSU 规范
                       let _ = mount(Some(&system_src), "/system", None::<&str>, MsFlags::MS_BIND | MsFlags::MS_REC, Some("KSU"));
                   }
               }
               Ok(())
           }
           EOF
-
           cat <<EOF > Cargo.toml
           [package]
           name = "ksu_meta_engine"
@@ -57,107 +53,105 @@ jobs:
           [profile.release]
           strip = true
           lto = true
-          panic = "abort"
           EOF
-          
           export PATH=$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH
           cargo build --release --target aarch64-linux-android
         env:
           CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER: aarch64-linux-android34-clang
 
-      - name: Assemble Full Metamodule Structure
+      - name: Assemble Full Structure with WebUI
         run: |
           mkdir -p build/bin
+          mkdir -p build/webroot
           mkdir -p build/META-INF/com/google/android
 
-          # 1. module.prop (关键：必须声明 metamodule=1)
+          # --- 1. 元模块标识 ---
           cat <<EOF > build/module.prop
-          id=nexus_full_meta
-          name=Nexus Full Meta-Engine (Rust)
+          id=nexus_meta_webui
+          name=Nexus Ultimate Meta (RS+Web)
           version=v1.0
           versionCode=1
           author=Gemini
-          description=全量原生 KernelSU 元模块基础设施，包含所有生命周期钩子。
+          description=带 WebUI 管理界面的原生 KSU 元模块基础设施。
           metamodule=1
           EOF
 
-          # --- 核心元模块钩子 ---
-          # 挂载处理引擎
+          # --- 2. WebUI 入口 (使用内核 API) ---
+          cat <<EOF > build/webroot/index.html
+          <!DOCTYPE html>
+          <html>
+          <head>
+              <meta charset="UTF-8">
+              <meta name="viewport" content="width=device-width, initial-scale=1.0">
+              <link rel="stylesheet" type="text/css" href="/internal/insets.css" />
+              <style>
+                  body { font-family: sans-serif; padding: 20px; background: #f0f0f0; color: #333; }
+                  .card { background: white; padding: 15px; border-radius: 12px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); margin-bottom: 15px; }
+                  button { background: #007bff; color: white; border: none; padding: 10px 20px; border-radius: 8px; width: 100%; font-size: 16px; }
+                  pre { background: #222; color: #0f0; padding: 10px; border-radius: 5px; overflow-x: auto; font-size: 12px; }
+              </style>
+          </head>
+          <body>
+              <div class="card">
+                  <h3>Nexus Meta 控制面板</h3>
+                  <p id="model">正在获取设备信息...</p>
+                  <button onclick="checkMounts()">查看当前挂载状态</button>
+              </div>
+              <div class="card">
+                  <pre id="log">等待操作...</pre>
+              </div>
+
+              <script type="module">
+                  import { exec, toast } from 'https://mui.kernelsu.org/lib/kernelsu.js';
+
+                  // 获取属性示例
+                  async function init() {
+                      const { stdout } = await exec("getprop ro.product.model");
+                      document.getElementById('model').innerText = "设备型号: " + stdout.trim();
+                  }
+
+                  window.checkMounts = async function() {
+                      toast('正在查询内核挂载表...');
+                      const { stdout } = await exec("mount | grep KSU");
+                      document.getElementById('log').innerText = stdout || "未发现 KSU 挂载点";
+                  }
+
+                  init();
+              </script>
+          </body>
+          </html>
+          EOF
+
+          # --- 3. 核心生命周期脚本 (保持之前的全量顺序) ---
           cat <<EOF > build/metamount.sh
           #!/system/bin/sh
-          MODDIR="\${0%/*}"
-          \$MODDIR/bin/ksu_meta_engine
+          \${0%/*}/bin/ksu_meta_engine
           EOF
+          
+          # 其他脚本设为空模版供以后扩展
+          touch build/metainstall.sh build/metauninstall.sh build/post-fs-data.sh build/service.sh build/boot-completed.sh build/customize.sh build/uninstall.sh
 
-          # 接管常规模块安装
-          cat <<EOF > build/metainstall.sh
-          #!/system/bin/sh
-          # 此脚本被 KernelSU 内置安装程序 source
-          ui_print "- [Meta] 正在通过元模块安装模块..."
-          EOF
-
-          # 常规模块卸载清理
-          cat <<EOF > build/metauninstall.sh
-          #!/system/bin/sh
-          MODULE_ID="\$1"
-          echo "[Meta] 正在清理模块: \$MODULE_ID"
-          EOF
-
-          # --- 标准模块生命周期脚本 ---
-          # 安装时交互脚本
-          cat <<EOF > build/customize.sh
-          ui_print "- 正在部署 Rust 元基础设施..."
-          ui_print "- 目标架构: AArch64 (8 Gen 3)"
-          EOF
-
-          # post-fs-data 阶段 (在挂载前运行)
-          cat <<EOF > build/post-fs-data.sh
-          #!/system/bin/sh
-          # 这里可以进行 sepolicy 注入
-          EOF
-
-          # service 阶段 (late_start)
-          cat <<EOF > build/service.sh
-          #!/system/bin/sh
-          # 后台守护进程启动处
-          EOF
-
-          # boot-completed 阶段 (系统启动完成后)
-          cat <<EOF > build/boot-completed.sh
-          #!/system/bin/sh
-          # 启动完成后的逻辑
-          EOF
-
-          # 元模块自卸载脚本 (当用户卸载本模块时)
-          cat <<EOF > build/uninstall.sh
-          #!/system/bin/sh
-          # 清理本模块在 /data 下的缓存
-          EOF
-
-          # --- 放置二进制文件 ---
-          cp target/aarch64-linux-android/release/ksu_meta_engine build/bin/
-
-          # --- 安装引导脚本 ---
+          # --- 4. 安装引导 (满足 #MAGISK 要求) ---
+          echo "#MAGISK" > build/META-INF/com/google/android/updater-script
           cat <<EOF > build/META-INF/com/google/android/update-binary
           #!/sbin/sh
           ZIPFILE="\$3"
-          MODPATH="/data/adb/modules/nexus_full_meta"
-          ui_print "- 开始释放元模块文件..."
+          MODPATH="/data/adb/modules/nexus_meta_webui"
           mkdir -p "\$MODPATH"
           unzip -o "\$ZIPFILE" -d "\$MODPATH"
-          # 设置所有脚本的可执行权限
           set_perm_recursive "\$MODPATH" 0 0 0755 0644
           chmod 755 "\$MODPATH/bin/ksu_meta_engine"
           find "\$MODPATH" -name "*.sh" -exec chmod 755 {} +
           EOF
+          cp target/aarch64-linux-android/release/ksu_meta_engine build/bin/
 
-      - name: Package Module
+      - name: Package Artifact
         run: |
           cd build
-          zip -r ../nexus_full_meta.zip ./*
+          zip -r ../nexus_meta_web.zip ./*
 
-      - name: Upload Artifact
+      - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: Nexus-Full-Meta-Zip
-          path: nexus_full_meta.zip
+          name: KSU-WebUI-Meta-RS
+          path: nexus_meta_web.zip
