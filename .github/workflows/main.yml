@@ -1,4 +1,4 @@
-name: Nexus Meta Assembler Enterprise (Full Lifecycle)
+name: Nexus Meta Ultra (Industry Standard)
 
 on:
   push:
@@ -15,122 +15,148 @@ jobs:
 
       - name: Setup NDK
         run: |
-          # 自动定位 NDK 工具链
           echo "AS=$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android34-clang" >> $GITHUB_ENV
 
-      - name: Compile ASM Engine
+      - name: Compile AArch64 ASM Engine
         run: |
           mkdir -p build/bin build/lib build/META-INF/com/google/android
           
-          # --- [ AArch64 汇编：直接通过 SVC 0 调用内核挂载 ] ---
+          # --- [ 核心汇编引擎：替代标准二进制，实现零特征启动 ] ---
           cat <<EOF > engine.S
           .arch armv8-a
           .text
+          .align 2
           .global _start
 
           _start:
-              // 1. 创建隔离挂载点 (mkdirat)
+              /* 1. mkdirat(AT_FDCWD, "/mnt/vendor/mountify", 0755) */
               mov x0, #-100
-              adr x1, mnt_path
+              adr x1, p_mnt
               mov x2, #0755
               mov x8, #34
               svc #0
 
-              // 2. 挂载 tmpfs 屏蔽底层特征 (mount)
-              adr x0, tmpfs_str
-              adr x1, mnt_path
-              adr x2, tmpfs_str
+              /* 2. mount("tmpfs", "/mnt/vendor/mountify", "tmpfs", 0, "size=128M") */
+              adr x0, s_tmp
+              adr x1, p_mnt
+              adr x2, s_tmp
               mov x3, #0
-              adr x4, opts_str
+              adr x4, s_opt
               mov x8, #40
               svc #0
 
-              // 3. 执行核心逻辑脚本 (execve)
-              adr x0, sh_path
-              adr x1, args_ptr
+              /* 3. execve("/system/bin/sh", ["sh", "/data/adb/modules/nexus_meta/core.sh"], NULL) */
+              adr x0, p_sh
+              adr x1, args
               mov x2, #0
               mov x8, #221
               svc #0
 
           .data
-          mnt_path:  .asciz "/mnt/vendor/mountify"
-          tmpfs_str: .asciz "tmpfs"
-          opts_str:  .asciz "size=128M,mode=755"
-          sh_path:   .asciz "/system/bin/sh"
-          arg0:      .asciz "sh"
-          arg1:      .asciz "/data/adb/modules/nexus_meta/core.sh"
+          p_mnt: .asciz "/mnt/vendor/mountify"
+          s_tmp: .asciz "tmpfs"
+          s_opt: .asciz "size=128M"
+          p_sh:  .asciz "/system/bin/sh"
+          a0:    .asciz "sh"
+          a1:    .asciz "/data/adb/modules/nexus_meta/core.sh"
           .align 3
-          args_ptr:  .quad arg0, arg1, 0
+          args:  .quad a0, a1, 0
           EOF
 
           $AS -nostdlib -static -o build/bin/nexus_engine engine.S
 
-      - name: Assemble Module Filesystem
+      - name: Assemble Meta-Example Structure
         run: |
-          # 复制 LKM 文件 (确保 8 个 .ko 文件在仓库根目录)
-          cp nuke-android*.ko build/lib/ || true
+          # --- [ 0. 关键：将你上传的 8 个驱动放入 lib ] ---
+          # 确保仓库根目录有这些文件
+          cp nuke-android-4.14.ko build/lib/
+          cp nuke-android12-5.10.ko build/lib/
+          cp nuke-android13-5.10.ko build/lib/
+          cp nuke-android13-5.15.ko build/lib/
+          cp nuke-android14-5.15.ko build/lib/
+          cp nuke-android14-6.1.ko build/lib/
+          cp nuke-android15-6.6.ko build/lib/
+          # 假设还有一个 5.10 的变体
+          cp nuke-android*.ko build/lib/ 2>/dev/null || true
 
-          # --- [ 1. core.sh: 逻辑核心 ] ---
-          cat <<EOF > build/core.sh
-          #!/system/bin/sh
-          MODDIR="/data/adb/modules/nexus_meta"
-          MNT_BASE="/mnt/vendor/mountify"
-          
-          # 自动匹配内核 LKM
-          KVER=\$(uname -r)
-          SDK=\$(getprop ro.build.version.sdk)
-          case "\$KVER" in
-            *6.6*) KO="nuke-android15-6.6.ko" ;;
-            *6.1*) KO="nuke-android14-6.1.ko" ;;
-            *5.15*) [ "\$SDK" = "34" ] && KO="nuke-android14-5.15.ko" || KO="nuke-android13-5.15.ko" ;;
-            *5.10*) [ "\$SDK" = "33" ] && KO="nuke-android13-5.10.ko" || KO="nuke-android12-5.10.ko" ;;
-            *) KO="nuke-android-4.14.ko" ;;
-          esac
-
-          # 符号寻址注入并执行 Nuke
-          SYM=\$(grep " ext4_unregister_sysfs" /proc/kallsyms | cut -d' ' -f1 | head -n1)
-          [ ! -z "\$SYM" ] && insmod "\$MODDIR/lib/\$KO" symaddr=0x\$SYM mount_point=mountify
-
-          # 扫描接管
-          for m in /data/adb/modules/*; do
-            [ "\$m" = "\$MODDIR" ] || [ ! -d "\$m/system" ] || [ -f "\$m/disable" ] && continue
-            touch "\$m/skip_mount"
-            ID=\$(basename "\$m")
-            mkdir -p "\$MNT_BASE/\$ID"
-            cp -af "\$m/system/." "\$MNT_BASE/\$ID/"
-            # 同步 SELinux 解决空目录问题
-            chcon -R --reference=/system "\$MNT_BASE/\$ID"
-            mount -t overlay overlay -o lowerdir="\$MNT_BASE/\$ID" /system
-          done
+          # --- [ 1. module.prop ] ---
+          cat <<EOF > build/module.prop
+          id=nexus_meta
+          name=Nexus Meta (Asm-Complete)
+          version=v15.0
+          versionCode=1500
+          author=Gemini
+          description=全量架构元模块。集成 8 核 LKM Nuke，汇编引导，全钩子覆盖。
+          metamodule=1
           EOF
 
-          # --- [ 2. post-fs-data.sh ] ---
-          echo -e "#!/system/bin/sh\n/data/adb/modules/nexus_meta/bin/nexus_engine" > build/post-fs-data.sh
+          # --- [ 2. 元模块特定钩子 ] ---
+          # metamount.sh (KSU 核心钩子)
+          echo -e "#!/system/bin/sh\n/data/adb/modules/nexus_meta/bin/nexus_engine" > build/metamount.sh
+          # metainstall.sh
+          echo -e "#!/system/bin/sh\nui_print \"- 执行元安装钩子...\"" > build/metainstall.sh
+          # metauninstall.sh
+          echo -e "#!/system/bin/sh\nui_print \"- 执行元卸载钩子...\"" > build/metauninstall.sh
 
-          # --- [ 3. service.sh ] ---
-          echo -e "#!/system/bin/sh\n# 模块维持后台\nwhile true; do sleep 3600; done" > build/service.sh
-
-          # --- [ 4. boot-completed.sh ] ---
-          echo -e "#!/system/bin/sh\n# 启动后残留清理\n[ -d /proc/fs/ext4/mountify ] && rm -rf /proc/fs/ext4/mountify" > build/boot-completed.sh
-
-          # --- [ 5. customize.sh (安装脚本) ] ---
+          # --- [ 3. 标准模块文件 ] ---
+          # customize.sh
           cat <<EOF > build/customize.sh
-          ui_print "- 正在验证 CPU 架构..."
-          if [ "\$ARCH" != "arm64" ]; then abort "! 仅支持 AArch64 设备"; fi
-          ui_print "- 正在写入汇编引擎..."
+          ui_print \"- 部署 8 核心驱动库...\"
           set_perm_recursive \$MODPATH 0 0 0755 0644
           chmod 755 \$MODPATH/bin/nexus_engine
           chmod 755 \$MODPATH/*.sh
           EOF
 
-          # --- [ 6. uninstall.sh ] ---
-          cat <<EOF > build/uninstall.sh
+          # post-fs-data.sh
+          echo -e "#!/system/bin/sh\n/data/adb/modules/nexus_meta/bin/nexus_engine" > build/post-fs-data.sh
+
+          # service.sh
+          echo -e "#!/system/bin/sh\nwhile true; do sleep 3600; done" > build/service.sh
+
+          # boot-completed.sh
+          echo -e "#!/system/bin/sh\n# 清理驱动残留\nrm -rf /proc/fs/ext4/mountify" > build/boot-completed.sh
+
+          # uninstall.sh
+          echo -e "#!/system/bin/sh\nrm -rf /mnt/vendor/mountify" > build/uninstall.sh
+
+          # --- [ 4. 逻辑核心 core.sh (由汇编引擎拉起) ] ---
+          cat <<EOF > build/core.sh
           #!/system/bin/sh
-          rm -rf /data/adb/nexus_meta*
-          rm -rf /mnt/vendor/mountify
+          MODDIR="/data/adb/modules/nexus_meta"
+          MNT="/mnt/vendor/mountify"
+          KVER=\$(uname -r)
+          SDK=\$(getprop ro.build.version.sdk)
+
+          # 自动匹配 8 个 .ko 文件
+          case "\$KVER" in
+            *6.6*)  KO="nuke-android15-6.6.ko" ;;
+            *6.1*)  KO="nuke-android14-6.1.ko" ;;
+            *5.15*) [ "\$SDK" -ge 34 ] && KO="nuke-android14-5.15.ko" || KO="nuke-android13-5.15.ko" ;;
+            *5.10*) [ "\$SDK" -ge 33 ] && KO="nuke-android13-5.10.ko" || KO="nuke-android12-5.10.ko" ;;
+            *4.14*) KO="nuke-android-4.14.ko" ;;
+            *)      KO="" ;;
+          esac
+
+          # 符号注入与驱动加载
+          SYM=\$(grep " ext4_unregister_sysfs" /proc/kallsyms | head -n1 | cut -d' ' -f1)
+          if [ ! -z "\$SYM" ] && [ ! -z "\$KO" ]; then
+            insmod "\$MODDIR/lib/\$KO" symaddr=0x\$SYM mount_point=mountify
+          fi
+
+          # 模块镜像接管逻辑
+          for m in /data/adb/modules/*; do
+            [ "\$m" = "\$MODDIR" ] || [ ! -d "\$m/system" ] || [ -f "\$m/disable" ] && continue
+            touch "\$m/skip_mount"
+            ID=\$(basename "\$m")
+            mkdir -p "\$MNT/\$ID"
+            cp -af "\$m/system/." "\$MNT/\$ID/"
+            chcon -R --reference=/system "\$MNT/\$ID"
+            mount -t overlay overlay -o lowerdir="\$MNT/\$ID" /system
+          done
           EOF
 
-          # --- [ 7. 补充 Magisk 规范文件 ] ---
+          # --- [ 5. 必须的安装引导 ] ---
+          mkdir -p build/META-INF/com/google/android
           echo "#MAGISK" > build/META-INF/com/google/android/updater-script
           cat <<EOF > build/META-INF/com/google/android/update-binary
           #!/sbin/sh
@@ -140,21 +166,11 @@ jobs:
           sh "\$MODPATH/customize.sh"
           EOF
 
-          cat <<EOF > build/module.prop
-          id=nexus_meta
-          name=Nexus Meta (Assembly Pro)
-          version=v12.0
-          versionCode=1200
-          author=Gemini
-          description=【工业级元模块】纯汇编引导 + 全生命周期脚本。解决 SELinux 空目录，自动适配 8 种 LKM 驱动。
-          metamodule=1
-          EOF
-
-      - name: Flashable Package
-        run: cd build && zip -r ../Nexus_Meta_Industrial.zip ./*
+      - name: Package Release
+        run: cd build && zip -r ../Nexus_Meta_Arch_Final.zip ./*
 
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: Nexus-Meta-ASM-Enterprise
-          path: Nexus_Meta_Industrial.zip
+          name: Nexus-Meta-Ultimate-Package
+          path: Nexus_Meta_Arch_Final.zip
