@@ -1,4 +1,4 @@
-name: Build Nexus Meta Ultra (Mountify Enhanced)
+name: Nexus Meta Ultimate (LKM Nuke Edition)
 
 on:
   push:
@@ -18,58 +18,87 @@ jobs:
         with:
           targets: aarch64-linux-android
 
-      - name: Build Mountify-Style Rust Engine
+      - name: Build Advanced Rust Engine
         run: |
           mkdir -p src
-          # 核心 Rust：实现内存拷贝、SELinux 镜像及伪装挂载
+          # --- [Rust 源代码：集成 LKM 匹配逻辑] ---
           cat <<EOF > src/main.rs
           use nix::mount::{mount, MsFlags};
           use std::fs;
           use std::process::Command;
-          use std::path::{Path, PathBuf};
+          use std::path::Path;
 
           fn main() -> Result<(), Box<dyn std::error::Error>> {
-              let config_mode = fs::read_to_string("/data/adb/nexus_meta.mode").unwrap_or("tmpfs".to_string());
+              // 1. 读取基础配置
+              let mode = fs::read_to_string("/data/adb/nexus_meta.mode").unwrap_or("tmpfs".to_string());
               let fake_name = fs::read_to_string("/data/adb/nexus_meta.conf").unwrap_or("mountify".to_string());
               let fake_name = fake_name.trim();
 
-              // 1. 创建内存 tmpfs 挂载点（Mountify 核心：防止扫描 /data）
-              let tmp_base = Path::new("/mnt/vendor").join(fake_name);
-              if !tmp_base.exists() { fs::create_dir_all(&tmp_base)?; }
+              // 2. 准备内存隔离层 (tmpfs)
+              let tmp_base_str = format!("/mnt/vendor/{}", fake_name);
+              let tmp_base = Path::new(&tmp_base_str);
+              if !tmp_base.exists() { let _ = fs::create_dir_all(tmp_base); }
               
-              let _ = mount(Some("tmpfs"), &tmp_base, Some("tmpfs"), MsFlags::empty(), Some("size=100M,mode=755"));
+              let _ = mount(Some("tmpfs"), tmp_base, Some("tmpfs"), MsFlags::empty(), Some("size=128M,mode=755"));
 
+              // 3. 扫描模块并拷贝挂载 (Mountify 核心逻辑)
               let modules_root = Path::new("/data/adb/modules");
-              if !modules_root.exists() { return Ok(()) }
+              if !modules_root.exists() { return Ok(()); }
 
+              let mut mounted_list = Vec::new();
               for entry in fs::read_dir(modules_root)? {
                   let entry = entry?;
                   let path = entry.path();
                   let mod_id = path.file_name().unwrap().to_str().unwrap();
 
-                  // 过滤逻辑
                   if mod_id == "nexus_meta" || path.join("disable").exists() || path.join("skip_mountify").exists() {
                       continue;
                   }
 
                   let sys_src = path.join("system");
                   if sys_src.is_dir() {
-                      // 2. 拷贝文件到 tmpfs 并镜像 SELinux (Mountify 1.1.4 逻辑)
                       let target_dir = tmp_base.join(mod_id);
+                      if !target_dir.exists() { let _ = fs::create_dir_all(&target_dir); }
+
+                      // 拷贝并镜像 SELinux 上下文
                       let _ = Command::new("cp").args(["-Lrf", sys_src.to_str().unwrap(), target_dir.to_str().unwrap()]).status();
-                      
-                      // 使用 busybox 恢复上下文
                       let _ = Command::new("chcon").args(["--reference", "/system", target_dir.to_str().unwrap()]).status();
 
-                      // 3. 执行 OverlayFS 挂载
-                      let opts = format!("lowerdir={}", target_dir.display());
-                      let _ = mount(Some("overlay"), "/system", Some("overlay"), MsFlags::empty(), Some(&opts));
+                      // 执行挂载
+                      let res = if mode.trim() == "overlay" {
+                          let opts = format!("lowerdir={}", target_dir.display());
+                          mount(Some("overlay"), "/system", Some("overlay"), MsFlags::empty(), Some(opts.as_str()))
+                      } else {
+                          mount(Some(target_dir.as_path()), "/system", None::<&str>, MsFlags::MS_BIND | MsFlags::MS_REC, Some("tmpfs"))
+                      };
+
+                      if res.is_ok() { mounted_list.push(mod_id.to_string()); }
+                  }
+              }
+              let _ = fs::write("/data/adb/nexus_mounted.list", mounted_list.join("\n"));
+
+              // 4. LKM Nuke 自动识别与加载 (处理你上传的 .ko 文件)
+              let uts = nix::sys::utsname::uname().unwrap();
+              let kernel = uts.release().to_str().unwrap();
+              let sdk = fs::read_to_string("/system/build.prop").unwrap_or_default();
+              
+              let ko_name = if kernel.contains("6.6") { "nuke-android15-6.6.ko" }
+                            else if kernel.contains("6.1") { "nuke-android14-6.1.ko" }
+                            else if kernel.contains("5.15") && sdk.contains("sdk_int=34") { "nuke-android14-5.15.ko" }
+                            else if kernel.contains("5.15") { "nuke-android13-5.15.ko" }
+                            else if kernel.contains("5.10") && sdk.contains("sdk_int=33") { "nuke-android13-5.10.ko" }
+                            else if kernel.contains("5.10") { "nuke-android12-5.10.ko" }
+                            else { "nuke-android-4.14.ko" };
+
+              let ko_path = format!("/data/adb/modules/nexus_meta/lib/{}", ko_name);
+              // 寻找 ext4_unregister_sysfs 的符号地址
+              let kallsyms = fs::read_to_string("/proc/kallsyms").unwrap_or_default();
+              if let Some(line) = kallsyms.lines().find(|l| l.contains(" ext4_unregister_sysfs")) {
+                  if let Some(addr) = line.split_whitespace().next() {
+                      let _ = Command::new("insmod").arg(&ko_path).arg(format!("symaddr=0x{}", addr)).arg(format!("mount_point={}", fake_name)).status();
                   }
               }
 
-              // 4. 尝试清理 ext4 sysfs (Mountify 2.3 逻辑)
-              let _ = Command::new("ksud").args(["kernel", "nuke-ext4-sysfs"]).status();
-              
               Ok(())
           }
           EOF
@@ -77,84 +106,79 @@ jobs:
           cat <<EOF > Cargo.toml
           [package]
           name = "ksu_meta_engine"
-          version = "6.0.0"
+          version = "7.0.0"
           edition = "2021"
           [dependencies]
-          nix = { version = "0.27", features = ["mount", "fs"] }
+          nix = { version = "0.27.1", features = ["mount", "fs"] }
           [[bin]]
           name = "ksu_meta_engine"
           path = "src/main.rs"
-          [profile.release]
-          strip = true
-          lto = true
           EOF
-
+          
           export PATH=$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH
           cargo build --release --target aarch64-linux-android
         env:
           CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER: aarch64-linux-android34-clang
 
-      - name: Assemble Final Package
+      - name: Assemble Release Package
         run: |
-          mkdir -p build/bin build/webroot build/META-INF/com/google/android
+          mkdir -p build/bin build/webroot build/lib build/META-INF/com/google/android
           
-          # 1. 核心属性
+          # 1. 复制你上传的所有 .ko 文件到 lib 目录 (假设它们在根目录)
+          cp nuke-android*.ko build/lib/
+          
+          # 2. 写入模块属性
           cat <<EOF > build/module.prop
-          id=nexus_meta_ultra
-          name=Nexus Meta Ultra (Mountify-RS)
-          version=v6.0
-          versionCode=600
-          author=Gemini & backslashxx
-          description=基于 Mountify 逻辑重构：支持 tmpfs 镜像挂载、SELinux 属性同步、ksud 节点擦除。
+          id=nexus_meta
+          name=Nexus Meta (LKM Nuke Edition)
+          version=v7.0.0
+          versionCode=700
+          author=Gemini
+          description=全量元引擎：自动识别内核并载入 LKM Nuke 抹除挂载特征。支持 tmpfs 镜像挂载。
           metamodule=1
           EOF
 
-          # 2. 增强版 WebUI (集成 Mountify 配置项)
+          # 3. WebUI 界面
           cat <<EOF > build/webroot/index.html
           <!DOCTYPE html><html><head><meta charset="UTF-8"><link rel="stylesheet" href="/internal/insets.css">
-          <style>body{font-family:sans-serif;padding:20px;background:#fdfdfd}.card{background:#fff;padding:18px;border-radius:15px;box-shadow:0 5px 15px rgba(0,0,0,0.05);margin-bottom:15px}
-          h4{margin:0 0 10px 0;color:#1a73e8}select,input{width:100%;padding:10px;margin:8px 0;border:1px solid #ddd;border-radius:8px}
-          button{width:100%;padding:14px;background:#1a73e8;color:#fff;border:none;border-radius:12px;font-weight:bold}</style></head>
-          <body><div class="card"><h4>挂载模式 (Mountify 核心)</h4>
-          <select id="mode"><option value="tmpfs">tmpfs (内存镜像 - 极致隐藏)</option><option value="ext4">ext4 (镜像模式 - 节省内存)</option></select>
-          <input id="fname" placeholder="伪装挂载文件夹名 (默认: mountify)">
-          <button onclick="save()">同步 Mountify 策略并重启</button></div>
-          <div class="card"><h4>高级反检测</h4><p style="font-size:12px;color:gray;">已自动开启 ksu-nuke 节点清除及 SELinux 上下文镜像。</p></div>
+          <style>body{font-family:sans-serif;padding:20px;background:#f5f5f7} .card{background:#fff;padding:20px;border-radius:15px;box-shadow:0 8px 16px rgba(0,0,0,0.05);margin-bottom:20px}
+          button{width:100%;padding:14px;background:#007aff;color:#fff;border:none;border-radius:10px;font-weight:600}</style></head>
+          <body><div class="card"><h3>内核保护状态</h3><p id="kver">正在获取内核版本...</p>
+          <button onclick="save()">重载元引擎</button></div>
           <script type="module">import { exec, toast } from 'https://mui.kernelsu.org/lib/kernelsu.js';
-          window.save=async()=>{
-            await exec('echo '+document.getElementById('mode').value+' > /data/adb/nexus_meta.mode');
-            await exec('echo '+document.getElementById('fname').value+' > /data/adb/nexus_meta.conf');
-            toast('策略已应用！请通过 KernelSU 重启生效。');
-          };</script></body></html>
+          window.save=async()=>{ toast('正在通过 Rust 引擎重载...'); await exec('/data/adb/modules/nexus_meta/bin/ksu_meta_engine'); };
+          const {stdout}=await exec('uname -r'); document.getElementById('kver').innerText='内核: '+stdout;
+          </script></body></html>
           EOF
 
-          # 3. 生命周期钩子
+          # 4. 关键挂载脚本
           cat <<EOF > build/metamount.sh
           #!/system/bin/sh
-          # 自动阻止原生的挂载逻辑 (Mountify 策略)
-          for mod in /data/adb/modules/*; do
-            if [ -d "\$mod/system" ]; then touch "\$mod/skip_mount"; fi
-          done
-          \${0%/*}/bin/ksu_meta_engine
+          MODDIR="\${0%/*}"
+          # 禁用常规挂载
+          for m in /data/adb/modules/*; do [ -d "\$m/system" ] && [ "\$m" != "\$MODDIR" ] && touch "\$m/skip_mount"; done
+          \$MODDIR/bin/ksu_meta_engine
           EOF
 
-          # 4. Magisk/KSU 标识与安装逻辑
+          # 5. 安装程序引导 (#MAGISK 规范)
           echo "#MAGISK" > build/META-INF/com/google/android/updater-script
           cat <<EOF > build/META-INF/com/google/android/update-binary
           #!/sbin/sh
-          ZIPFILE="\$3"; MODPATH="/data/adb/modules/nexus_meta_ultra"
-          mkdir -p "\$MODPATH"; unzip -o "\$ZIPFILE" -d "\$MODPATH"
+          MODPATH="/data/adb/modules/nexus_meta"
+          mkdir -p "\$MODPATH"
+          unzip -o "\$3" -d "\$MODPATH"
           set_perm_recursive "\$MODPATH" 0 0 0755 0644
           chmod 755 "\$MODPATH/bin/ksu_meta_engine"
           find "\$MODPATH" -name "*.sh" -exec chmod 755 {} +
           EOF
+
           cp target/aarch64-linux-android/release/ksu_meta_engine build/bin/
 
-      - name: Package Artifact
-        run: cd build && zip -r ../Nexus_Meta_Ultra_v6.zip ./*
+      - name: Zip Artifact
+        run: cd build && zip -r ../Nexus_Meta_LKM_Final.zip ./*
 
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: Nexus-Meta-Ultra-V6
-          path: Nexus_Meta_Ultra_v6.zip
+          name: Nexus-Meta-LKM-Edition
+          path: Nexus_Meta_LKM_Final.zip
