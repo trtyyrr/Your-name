@@ -23,7 +23,7 @@ jobs:
           # 1. 创建源码目录
           mkdir -p src
           
-          # 2. 写入 Rust 核心逻辑
+          # 2. 写入 Rust 核心逻辑 (修复了 mount 逻辑)
           cat <<EOF > src/main.rs
           use nix::mount::{mount, MsFlags};
           use std::fs;
@@ -32,21 +32,35 @@ jobs:
           fn main() -> Result<(), Box<dyn std::error::Error>> {
               let modules_root = Path::new("/data/adb/modules");
               if !modules_root.exists() { return Ok(()); }
+              
+              println!("[NexusMeta] Rust Engine Start...");
+
               for entry in fs::read_dir(modules_root)? {
                   let entry = entry?;
                   let mod_path = entry.path();
-                  if mod_path.join("disable").exists() || mod_path.join("skip_mount").exists() { continue; }
+                  
+                  // 过滤逻辑
+                  if mod_path.join("disable").exists() || mod_path.join("skip_mount").exists() {
+                      continue;
+                  }
+
                   let system_src = mod_path.join("system");
                   if system_src.is_dir() {
-                      // KSU 挂载标准：source 必须为 "KSU"
-                      let _ = mount(Some(&system_src), "/system", None::<&str>, MsFlags::MS_BIND | MsFlags::MS_REC, Some("KSU"));
+                      // KSU 强制规范：data 参数必须是 "KSU"
+                      let _ = mount(
+                          Some(&system_src),
+                          "/system",
+                          None::<&str>,
+                          MsFlags::MS_BIND | MsFlags::MS_REC,
+                          Some("KSU")
+                      );
                   }
               }
               Ok(())
           }
           EOF
 
-          # 3. 写入完整的 Cargo.toml
+          # 3. 写入修正后的 Cargo.toml (显式开启 mount feature)
           cat <<EOF > Cargo.toml
           [package]
           name = "nexus_meta_engine"
@@ -54,20 +68,20 @@ jobs:
           edition = "2021"
 
           [dependencies]
-          nix = "0.27"
+          nix = { version = "0.27", features = ["mount", "fs"] }
 
           [[bin]]
           name = "nexus_meta_engine"
           path = "src/main.rs"
 
           [profile.release]
-          strip = true      # 自动精简体积
-          opt-level = "z"   # 优化大小
-          lto = true        # 链接时优化
+          strip = true
+          opt-level = "z"
+          lto = true
           EOF
           
-          # 4. 执行编译
-          # 环境变量确保使用 NDK 的 Clang 链接器
+          # 4. 执行交叉编译
+          # 自动寻找 NDK 路径并设置链接器
           export PATH=$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH
           cargo build --release --target aarch64-linux-android
         env:
@@ -78,32 +92,34 @@ jobs:
           mkdir -p build/bin
           mkdir -p build/META-INF/com/google/android
           
-          # 拷贝编译出的二进制文件
+          # 拷贝二进制
           cp target/aarch64-linux-android/release/nexus_meta_engine build/bin/
           
-          # 写入元模块标识 (Metamodule Identifier)
+          # 核心：元模块标识 (Metamodule Identifier)
           cat <<EOF > build/module.prop
           id=nexus_meta_rust
           name=Nexus Meta-Engine (RS)
           version=v1.0
           versionCode=1
           author=Gemini
-          description=Infrastructure Metamodule written in Rust for KernelSU.
+          description=High-performance Metamodule Infrastructure for KernelSU.
           metamodule=1
           EOF
 
-          # 写入元挂载钩子脚本
+          # 核心钩子：metamount.sh
           cat <<EOF > build/metamount.sh
           #!/system/bin/sh
           MODDIR="\${0%/*}"
+          # 启动时执行 Rust 引擎
           \$MODDIR/bin/nexus_meta_engine
           EOF
 
-          # 写入通用的更新脚本
+          # 安装脚本
           cat <<EOF > build/META-INF/com/google/android/update-binary
           #!/sbin/sh
           ZIPFILE="\$3"
           MODPATH="/data/adb/modules/nexus_meta_rust"
+          ui_print "- Installing Nexus Rust Meta-Engine"
           mkdir -p "\$MODPATH"
           unzip -o "\$ZIPFILE" -d "\$MODPATH"
           set_perm_recursive "\$MODPATH" 0 0 0755 0644
