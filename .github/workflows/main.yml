@@ -1,4 +1,4 @@
-name: Build Native KSU Metamodule
+name: Build Full Engineering KSU Metamodule
 
 on:
   push:
@@ -21,7 +21,6 @@ jobs:
       - name: Build Rust Mounting Engine
         run: |
           mkdir -p src
-          # Rust 核心：实现高效遍历与 bind mount
           cat <<EOF > src/main.rs
           use nix::mount::{mount, MsFlags};
           use std::fs;
@@ -30,28 +29,15 @@ jobs:
           fn main() -> Result<(), Box<dyn std::error::Error>> {
               let modules_root = Path::new("/data/adb/modules");
               if !modules_root.exists() { return Ok(()); }
-              
-              println!("[KSU-Meta] Starting Infrastructure Mounting...");
-
+              println!("[Nexus] 执行元挂载中...");
               for entry in fs::read_dir(modules_root)? {
                   let entry = entry?;
                   let mod_path = entry.path();
-                  
-                  // KSU 标准标志位检查
-                  if mod_path.join("disable").exists() || mod_path.join("skip_mount").exists() {
-                      continue;
-                  }
-
+                  if mod_path.join("disable").exists() || mod_path.join("skip_mount").exists() { continue; }
                   let system_src = mod_path.join("system");
                   if system_src.is_dir() {
-                      // 关键要求：source 必须设为 "KSU"
-                      let _ = mount(
-                          Some(&system_src),
-                          "/system",
-                          None::<&str>,
-                          MsFlags::MS_BIND | MsFlags::MS_REC,
-                          Some("KSU")
-                      );
+                      // 严格遵守 KSU source=KSU 规范
+                      let _ = mount(Some(&system_src), "/system", None::<&str>, MsFlags::MS_BIND | MsFlags::MS_REC, Some("KSU"));
                   }
               }
               Ok(())
@@ -79,80 +65,99 @@ jobs:
         env:
           CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER: aarch64-linux-android34-clang
 
-      - name: Assemble Native KSU Metamodule
+      - name: Assemble Full Metamodule Structure
         run: |
           mkdir -p build/bin
           mkdir -p build/META-INF/com/google/android
 
-          # 1. module.prop (标记 metamodule=1)
+          # 1. module.prop (关键：必须声明 metamodule=1)
           cat <<EOF > build/module.prop
-          id=native_ksu_meta
-          name=Native Rust Metamodule
+          id=nexus_full_meta
+          name=Nexus Full Meta-Engine (Rust)
           version=v1.0
           versionCode=1
           author=Gemini
-          description=KernelSU 原生元模块基础设施，完全自定义挂载与安装逻辑。
+          description=全量原生 KernelSU 元模块基础设施，包含所有生命周期钩子。
           metamodule=1
           EOF
 
-          # 2. metamount.sh (KSU 启动第 6 步钩子)
+          # --- 核心元模块钩子 ---
+          # 挂载处理引擎
           cat <<EOF > build/metamount.sh
           #!/system/bin/sh
           MODDIR="\${0%/*}"
-          # 必须将源/设备名称设置为 "KSU" 的逻辑已在二进制中实现
           \$MODDIR/bin/ksu_meta_engine
           EOF
 
-          # 3. metainstall.sh (接管常规模块安装)
+          # 接管常规模块安装
           cat <<EOF > build/metainstall.sh
           #!/system/bin/sh
-          # 此脚本继承 install.sh 的所有变量和函数 (ui_print, abort 等)
-          ui_print "- 元模块: 正在介入常规模块安装流程"
-          # 可以在此处执行 install_module 之前的预处理
+          # 此脚本被 KernelSU 内置安装程序 source
+          ui_print "- [Meta] 正在通过元模块安装模块..."
           EOF
 
-          # 4. metauninstall.sh (清理钩子)
+          # 常规模块卸载清理
           cat <<EOF > build/metauninstall.sh
           #!/system/bin/sh
           MODULE_ID="\$1"
-          ui_print "- 元模块: 正在清理模块 \$MODULE_ID 的残留资源"
+          echo "[Meta] 正在清理模块: \$MODULE_ID"
           EOF
 
-          # 5. 元模块自身的生命周期脚本
+          # --- 标准模块生命周期脚本 ---
+          # 安装时交互脚本
+          cat <<EOF > build/customize.sh
+          ui_print "- 正在部署 Rust 元基础设施..."
+          ui_print "- 目标架构: AArch64 (8 Gen 3)"
+          EOF
+
+          # post-fs-data 阶段 (在挂载前运行)
           cat <<EOF > build/post-fs-data.sh
           #!/system/bin/sh
-          # 在元模块和常规模块脚本之前运行
+          # 这里可以进行 sepolicy 注入
           EOF
 
+          # service 阶段 (late_start)
           cat <<EOF > build/service.sh
           #!/system/bin/sh
-          # 元模块专属后台服务
+          # 后台守护进程启动处
           EOF
 
-          # 6. 核心二进制文件
+          # boot-completed 阶段 (系统启动完成后)
+          cat <<EOF > build/boot-completed.sh
+          #!/system/bin/sh
+          # 启动完成后的逻辑
+          EOF
+
+          # 元模块自卸载脚本 (当用户卸载本模块时)
+          cat <<EOF > build/uninstall.sh
+          #!/system/bin/sh
+          # 清理本模块在 /data 下的缓存
+          EOF
+
+          # --- 放置二进制文件 ---
           cp target/aarch64-linux-android/release/ksu_meta_engine build/bin/
 
-          # 7. update-binary (标准的安装引导)
+          # --- 安装引导脚本 ---
           cat <<EOF > build/META-INF/com/google/android/update-binary
           #!/sbin/sh
           ZIPFILE="\$3"
-          MODPATH="/data/adb/modules/native_ksu_meta"
+          MODPATH="/data/adb/modules/nexus_full_meta"
+          ui_print "- 开始释放元模块文件..."
           mkdir -p "\$MODPATH"
           unzip -o "\$ZIPFILE" -d "\$MODPATH"
+          # 设置所有脚本的可执行权限
           set_perm_recursive "\$MODPATH" 0 0 0755 0644
           chmod 755 "\$MODPATH/bin/ksu_meta_engine"
-          chmod 755 "\$MODPATH/metamount.sh"
-          [ -f "\$MODPATH/metainstall.sh" ] && chmod 755 "\$MODPATH/metainstall.sh"
-          [ -f "\$MODPATH/metauninstall.sh" ] && chmod 755 "\$MODPATH/metauninstall.sh"
+          find "\$MODPATH" -name "*.sh" -exec chmod 755 {} +
           EOF
 
-      - name: Zip Artifact
+      - name: Package Module
         run: |
           cd build
-          zip -r ../ksu_meta_native.zip ./*
+          zip -r ../nexus_full_meta.zip ./*
 
-      - name: Upload
+      - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: KSU-Native-Meta-RS
-          path: ksu_meta_native.zip
+          name: Nexus-Full-Meta-Zip
+          path: nexus_full_meta.zip
