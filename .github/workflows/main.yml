@@ -1,4 +1,4 @@
-name: Nexus SM8650 One-Click Builder (Bazel Fixed)
+name: Nexus SM8650 One-Click Builder (Symlink Fixed)
 on:
   workflow_dispatch:
 
@@ -11,18 +11,18 @@ jobs:
           sudo docker rmi $(docker images -q)
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost /var/lib/apt/lists/*
           sudo apt-get clean
-          df -h
 
       - name: 2. 安装环境依赖
         run: |
           sudo apt-get update
           sudo apt-get install -y git-core gnupg flex bison build-essential zip curl zlib1g-dev libncurses5-dev libssl-dev python3-pip aria2
+          pip3 install pandas
           mkdir ~/bin
           curl https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
           chmod a+x ~/bin/repo
           echo "PATH=$PATH:$HOME/bin" >> $GITHUB_ENV
 
-      - name: 3. 极速重组源码树 (补全 Bazel 二进制)
+      - name: 3. 极速重组源码树 (物理修复目录结构)
         run: |
           mkdir -p kernel_workspace && cd kernel_workspace
           
@@ -37,38 +37,50 @@ jobs:
           
           # 物理组装 Manifest 层级
           mkdir -p kernel_platform/tools
+          mkdir -p kernel_platform/build # 提前创建 build 目录，防止脚本创建软链接失败
+          
           mv common kernel_platform/
           mv msm-kernel kernel_platform/
           mv build_tools/* kernel_platform/
           
-          # 【修复】手动补全脚本所需的 Bazel 二进制文件
-          echo "正在下载 Bazel 编译引擎..."
+          # 下载 Bazel 二进制
           curl -Lo kernel_platform/tools/bazel https://github.com/bazelbuild/bazel/releases/download/6.3.2/bazel-6.3.2-linux-x86_64
           chmod +x kernel_platform/tools/bazel
           
           # 建立必需的软链接
           cd kernel_platform
-          ln -s . WORKSPACE
-          ln -s msm-kernel/build_with_bazel.py build_with_bazel.py
-          df -h
+          ln -sf . WORKSPACE
+          ln -sf msm-kernel/build_with_bazel.py build_with_bazel.py
+          
+          # 【核心修复】手动物理修复脚本报错的软链接
+          # 脚本原本想在 build/ 下找 msm_kernel_extensions.bzl，我们直接给它放过去
+          if [ -f "msm-kernel/msm_kernel_extensions.bzl" ]; then
+            cp msm-kernel/msm_kernel_extensions.bzl build/
+          fi
+          
+          echo "当前目录结构验证："
+          ls -F
+          ls -F build/
 
       - name: 4. 修复脚本 Bug (AttributeError Patch)
         run: |
           cd kernel_workspace/kernel_platform/msm-kernel
-          # 物理注入补丁，解决 process_list 缺失导致的崩溃
+          # 物理注入 process_list 变量补丁
           sed -i '/def __init__(self/a \        self.process_list = []' build_with_bazel.py
           echo "补丁已应用"
 
-      - name: 5. 执行 Bazel 编译 (GKI Image)
+      - name: 5. 执行 Bazel 编译 (限制并发)
         run: |
           cd kernel_workspace/kernel_platform
-          # 执行编译。由于 GitHub Actions 内存限制，强制限制并发以防 OOM
-          python3 build_with_bazel.py -t sm8650 gki --jobs=4
+          # 针对 SM8650 GKI
+          # 使用 --jobs=2 极其重要，防止内存溢出
+          python3 build_with_bazel.py -t sm8650 gki --jobs=2
           
           if [ -f "out/msm-kernel-sm8650-gki/dist/Image" ]; then
             echo "IMAGE_READY=true" >> $GITHUB_ENV
           else
-            echo "编译失败：产物未生成" && exit 1
+            echo "编译失败：未检测到 Image 产物"
+            exit 1
           fi
 
       - name: 6. 封装 AnyKernel3
@@ -76,14 +88,9 @@ jobs:
         run: |
           git clone https://github.com/osm0sis/AnyKernel3 nexus_ak3
           cd nexus_ak3
-          # 适配一加 Pad Pro (init_boot 分区)
           sed -i 's/block=\/dev\/block\/tdb/block=\/dev\/block\/by-name\/init_boot/g' anykernel.sh
           sed -i 's/is_slot_device=0/is_slot_device=1/g' anykernel.sh
-          
-          # 复制内核镜像
           cp ../kernel_workspace/kernel_platform/out/msm-kernel-sm8650-gki/dist/Image .
-          
-          # 清理并打包
           rm -rf .git README.md
           zip -r9 ../Nexus_Kernel_SM8650_Flashable.zip *
 
@@ -91,5 +98,5 @@ jobs:
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: Oneplus-PadPro-Kernel-Update
+          name: Oneplus-PadPro-Kernel
           path: Nexus_Kernel_SM8650_Flashable.zip
