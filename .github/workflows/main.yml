@@ -1,83 +1,91 @@
-name: Nexus SM8650 Stable Kbuild (No-Bazel)
+name: Build Nexus Rust Metamodule
+
 on:
+  push:
+    branches: [ "main" ]
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
-      - name: 1. 环境初始化
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Install NDK & Toolchain
         run: |
-          sudo apt update && sudo apt install -y --no-install-recommends binutils python-is-python3 libssl-dev libelf-dev aria2 zip unzip ccache bc libncurses-dev flex bison
-          mkdir -p kernel_workspace && cd kernel_workspace
+          sudo apt-get update
+          sudo apt-get install -y zip
+          echo "NDK_HOME=${ANDROID_NDK_LATEST_HOME}" >> $GITHUB_ENV
 
-          echo "正在下载 Common 核心源码..."
-          aria2c -s16 -x16 -k1M https://github.com/cctv18/android_kernel_common_oneplus_sm8650/archive/refs/heads/oneplus/sm8650_v_15.0.0_oneplus12_6.1.118.zip -o common.zip
-          unzip -q common.zip && mv android_kernel_common_oneplus_sm8650-* common && rm common.zip
-
-          echo "正在下载工具链 (Clang 20)..."
-          mkdir -p clang20
-          aria2c -s16 -x16 -k1M https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang20-r547379/clang-r547379.zip -o clang.zip
-          unzip -q clang.zip -d clang20 && rm clang.zip
-
-      - name: 2. 源码预处理
+      - name: Build Rust Engine
         run: |
-          cd kernel_workspace/common
-          echo "去除 ABI 保护..."
-          rm android/abi_gki_protected_exports_* || true
-          
-          echo "修正版本后缀..."
-          sed -i 's/ -dirty//g' scripts/setlocalversion
-
-      - name: 3. 执行传统 Makefile 编译 (GKI 架构)
-        run: |
-          cd kernel_workspace/common
-          
-          # 设置工具链路径
-          CLANG_PATH=$(pwd)/../clang20/bin
-          export PATH="$CLANG_PATH:$PATH"
-          
-          # 定义编译参数
-          MAKE_ARGS="
-            ARCH=arm64 \
-            LLVM=1 \
-            LLVM_IAS=1 \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
-            CLANG_TRIPLE=aarch64-linux-gnu-
-          "
-          
-          echo "生成默认配置 (gki_defconfig)..."
-          make $MAKE_ARGS gki_defconfig
-          
-          echo "开始核心编译 (仅编译内核镜像)..."
-          # 限制 jobs 为 4，防止 GitHub Actions 内存溢出
-          make $MAKE_ARGS -j4 Image
-
-      - name: 4. 提取产物并封装 AnyKernel3
-        run: |
-          cd kernel_workspace
-          git clone https://github.com/osm0sis/AnyKernel3 nexus_ak3
-          cd nexus_ak3
-          
-          # 适配一加 Pad Pro 分区
-          sed -i 's/block=\/dev\/block\/tdb/block=\/dev\/block\/by-name\/init_boot/g' anykernel.sh
-          sed -i 's/is_slot_device=0/is_slot_device=1/g' anykernel.sh
-          
-          # 寻找编译好的 Image
-          # 传统编译产物在 arch/arm64/boot/Image
-          if [ -f "../common/arch/arm64/boot/Image" ]; then
-            cp "../common/arch/arm64/boot/Image" .
-            zip -r9 ../Nexus_Stable_Kernel.zip *
-            echo "IMAGE_READY=true" >> $GITHUB_ENV
-          else
-            echo "编译失败：未在 arch/arm64/boot/ 下找到 Image"
-            exit 1
+          # 动态创建 Cargo.toml 如果不存在
+          if [ ! -f Cargo.toml ]; then
+            echo '[package]' > Cargo.toml
+            echo 'name = "nexus_meta_engine"' >> Cargo.toml
+            echo 'version = "0.1.0"' >> Cargo.toml
+            echo 'edition = "2021"' >> Cargo.toml
+            echo '[dependencies]' >> Cargo.toml
+            echo 'nix = "0.27"' >> Cargo.toml
           fi
+          
+          # 使用 cargo-ndk 或直接指定 linker 编译
+          cargo build --release --target aarch64-linux-android
+        env:
+          CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER: aarch64-linux-android34-clang
 
-      - name: 5. 上传刷机包
-        if: env.IMAGE_READY == 'true'
+      - name: Prepare Metamodule Structure
+        run: |
+          mkdir -p build/bin
+          mkdir -p build/META-INF/com/google/android
+          
+          # 拷贝编译产物
+          cp target/aarch64-linux-android/release/nexus_meta_engine build/bin/
+          
+          # 写入 module.prop
+          cat <<EOF > build/module.prop
+          id=nexus_meta_rust
+          name=Nexus Meta-Engine (RS)
+          version=v1.0
+          versionCode=1
+          author=Gemini
+          description=High-performance Rust-based Metamodule for KernelSU.
+          metamodule=1
+          EOF
+
+          # 写入 metamount.sh 钩子
+          cat <<EOF > build/metamount.sh
+          #!/system/bin/sh
+          MODDIR="\${0%/*}"
+          \$MODDIR/bin/nexus_meta_engine
+          EOF
+
+          # 写入安装脚本
+          cat <<EOF > build/META-INF/com/google/android/update-binary
+          #!/sbin/sh
+          ZIPFILE="\$3"
+          MODPATH="/data/adb/modules/nexus_meta_rust"
+          mkdir -p "\$MODPATH"
+          unzip -o "\$ZIPFILE" -d "\$MODPATH"
+          set_perm_recursive "\$MODPATH" 0 0 0755 0644
+          set_perm "\$MODPATH/bin/nexus_meta_engine" 0 0 0755
+          set_perm "\$MODPATH/metamount.sh" 0 0 0755
+          EOF
+
+      - name: Package Module
+        run: |
+          cd build
+          zip -r ../nexus_meta_rust.zip ./*
+
+      - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Nexus-Kbuild-Kernel
-          path: Nexus_Stable_Kernel.zip
+          name: Nexus-Meta-RS-Zip
+          path: nexus_meta_rust.zip
