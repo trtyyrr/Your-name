@@ -9,66 +9,83 @@ jobs:
       - name: 1. 极致环境初始化
         run: |
           sudo apt update && sudo apt install -y --no-install-recommends binutils python-is-python3 libssl-dev libelf-dev aria2 zip unzip ccache
-          mkdir kernel_workspace && cd kernel_workspace
+          mkdir -p kernel_workspace && cd kernel_workspace
 
-          echo "正在极速克隆一加 SM8650 核心源码..."
+          echo "正在下载核心源码 (Common)..."
           aria2c -s16 -x16 -k1M https://github.com/cctv18/android_kernel_common_oneplus_sm8650/archive/refs/heads/oneplus/sm8650_v_15.0.0_oneplus12_6.1.118.zip -o common.zip
           unzip -q common.zip && mv android_kernel_common_oneplus_sm8650-* common && rm common.zip
 
-          echo "正在下载专用 LLVM-Clang20 工具链..."
+          echo "正在下载驱动源码 (MSM-Kernel)..."
+          # 注意：这里下载包含 build_with_bazel.py 的驱动仓库
+          aria2c -s16 -x16 -k1M https://github.com/OnePlusOSS/android_kernel_oneplus_sm8650/archive/refs/heads/oneplus/sm8650_v_15.0.0_pad_pro.zip -o msm.zip
+          unzip -q msm.zip && mv android_kernel_oneplus_sm8650-* msm-kernel && rm msm.zip
+
+          echo "正在下载工具链 (Clang20)..."
           mkdir -p clang20
           aria2c -s16 -x16 -k1M https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang20-r547379/clang-r547379.zip -o clang.zip
           unzip -q clang.zip -d clang20 && rm clang.zip
 
-          echo "正在下载一加专用构建脚本..."
+          echo "正在下载构建工具 (Build-Tools)..."
           aria2c -s16 -x16 -k1M https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang20-r547379/build-tools.zip -o build-tools.zip
           unzip -q build-tools.zip && rm build-tools.zip
 
-      - name: 2. 物理破解 ABI 限制与后缀
+      - name: 2. 物理目录重组 (修复 File Not Found)
         run: |
           cd kernel_workspace
+          # 建立一加脚本期望的目录层级
+          mkdir -p kernel_platform
+          mv common kernel_platform/
+          mv msm-kernel kernel_platform/
+          # 将 build-tools 内的文件（包括 build, tools 等）移入平台根目录
+          cp -r bin kernel_platform/ 2>/dev/null || true
+          # 把关键的编译脚本从驱动目录移到平台根目录
+          cp kernel_platform/msm-kernel/build_with_bazel.py kernel_platform/
+          
+          echo "检查脚本位置："
+          ls -l kernel_platform/build_with_bazel.py
+
+      - name: 3. 物理破解 ABI 限制与脚本补丁
+        run: |
+          cd kernel_workspace/kernel_platform
           echo "正在去除 GKI ABI 保护..."
           rm common/android/abi_gki_protected_exports_* || true
           
-          # 去除 -dirty 后缀，保证内核名称纯净
+          # 修复脚本内部的 process_list Bug
+          sed -i '/def __init__(self/a \        self.process_list = []' build_with_bazel.py
+          
+          # 去除 -dirty 后缀
           for f in common/scripts/setlocalversion; do
             sed -i 's/ -dirty//g' "$f"
           done
 
-      - name: 3. 执行核心编译 (一加 Pad Pro 适配)
+      - name: 4. 执行核心编译 (SM8650 GKI)
         run: |
-          cd kernel_workspace
-          # 设置环境变量指向我们下载的 Clang20
-          export PATH=$(pwd)/clang20/bin:$(pwd)/bin:$PATH
-          export CLANG_TRIPLE=aarch64-linux-gnu-
-          export ARCH=arm64
-          export SUBARCH=arm64
+          cd kernel_workspace/kernel_platform
+          # 设置工具链路径
+          export PATH=$(pwd)/../clang20/bin:$PATH
           
-          # 直接调用构建脚本进行编译
-          # 注意：这里调用的是下载回来的 build.sh 或 build_with_bazel.py
-          # 由于我们补齐了 build-tools 文件夹，脚本将不再报错找不到依赖
-          python3 build_with_bazel.py -t sm8650 gki --jobs=$(nproc)
+          # 执行编译。由于 GitHub 内存只有 7G，强制 jobs=2 保证不崩溃
+          python3 build_with_bazel.py -t sm8650 gki --jobs=2
 
-      - name: 4. 封装 AnyKernel3
+      - name: 5. 封装 AnyKernel3
         run: |
           cd kernel_workspace
           git clone https://github.com/osm0sis/AnyKernel3 nexus_ak3
           cd nexus_ak3
-          # 适配 init_boot 分区
           sed -i 's/block=\/dev\/block\/tdb/block=\/dev\/block\/by-name\/init_boot/g' anykernel.sh
           sed -i 's/is_slot_device=0/is_slot_device=1/g' anykernel.sh
           
-          # 寻找编译好的镜像 (通常在一加的 out 目录下)
-          IMAGE=$(find ../out -name Image -type f | head -n 1)
+          # 寻找 Image
+          IMAGE=$(find ../kernel_platform/out -name Image -type f | head -n 1)
           if [ -f "$IMAGE" ]; then
             cp "$IMAGE" .
             zip -r9 ../Nexus_Kernel_Update.zip *
           else
-            echo "未找到内核镜像，编译可能失败！" && exit 1
+            echo "错误：编译未生成 Image" && exit 1
           fi
 
-      - name: 5. 上传最终产物
+      - name: 6. 上传产物
         uses: actions/upload-artifact@v4
         with:
-          name: Oneplus-PadPro-Kernel-Custom
-          path: kernel_workspace/Nexus_Kernel_Update.zip
+          name: Oneplus-PadPro-Kernel
+          path: Nexus_Kernel_Update.zip
