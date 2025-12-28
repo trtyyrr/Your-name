@@ -6,86 +6,93 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: 1. 极致环境初始化
+      - name: 1. 环境初始化与极速下载
         run: |
           sudo apt update && sudo apt install -y --no-install-recommends binutils python-is-python3 libssl-dev libelf-dev aria2 zip unzip ccache
-          mkdir -p kernel_workspace/kernel_platform && cd kernel_workspace
+          
+          # 创建完全符合脚本预期的根目录
+          mkdir -p kernel_workspace && cd kernel_workspace
 
           echo "正在下载核心源码 (Common)..."
           aria2c -s16 -x16 -k1M https://github.com/cctv18/android_kernel_common_oneplus_sm8650/archive/refs/heads/oneplus/sm8650_v_15.0.0_oneplus12_6.1.118.zip -o common.zip
-          unzip -q common.zip && mv android_kernel_common_oneplus_sm8650-* kernel_platform/common && rm common.zip
+          unzip -q common.zip && mv android_kernel_common_oneplus_sm8650-* common && rm common.zip
 
           echo "正在下载驱动源码 (MSM-Kernel)..."
           aria2c -s16 -x16 -k1M https://github.com/OnePlusOSS/android_kernel_oneplus_sm8650/archive/refs/heads/oneplus/sm8650_v_15.0.0_pad_pro.zip -o msm.zip
-          unzip -q msm.zip && mv android_kernel_oneplus_sm8650-* kernel_platform/msm-kernel && rm msm.zip
+          unzip -q msm.zip && mv android_kernel_oneplus_sm8650-* msm-kernel && rm msm.zip
 
           echo "正在下载工具链 (Clang20)..."
           mkdir -p clang20
           aria2c -s16 -x16 -k1M https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang20-r547379/clang-r547379.zip -o clang.zip
           unzip -q clang.zip -d clang20 && rm clang.zip
 
-      - name: 2. 物理补全 Bazel 二进制与构建工具
+      - name: 2. 物理对齐脚本路径 (修复 ERROR: failed to find Bazel)
         run: |
-          cd kernel_workspace/kernel_platform
+          cd kernel_workspace
           
-          # 1. 物理补全 Bazel 二进制文件 (脚本的核心报错点)
+          # 【关键修复】在脚本报错的精确位置创建 tools 目录并下载 Bazel
           mkdir -p tools
           curl -Lo tools/bazel https://github.com/bazelbuild/bazel/releases/download/6.3.2/bazel-6.3.2-linux-x86_64
           chmod +x tools/bazel
           
-          # 2. 补全必要的构建链接
-          ln -sf . WORKSPACE
-          cp msm-kernel/build_with_bazel.py .
+          # 建立 Bazel 工作空间必需的文件
+          touch WORKSPACE
           
-          # 3. 补全 build 目录 (脚本需要在这里写扩展)
+          # 建立 build 目录并放置必要的扩展文件，防止脚本创建软链接失败
           mkdir -p build
           [ -f "msm-kernel/msm_kernel_extensions.bzl" ] && cp msm-kernel/msm_kernel_extensions.bzl build/
           
-          echo "验证 Bazel 路径："
+          # 把编译脚本从驱动仓拷贝到根目录，使其能同时看到 common 和 msm-kernel
+          cp msm-kernel/build_with_bazel.py .
+          
+          echo "检查物理路径对齐情况："
           ls -l tools/bazel
+          ls -l build_with_bazel.py
 
-      - name: 3. 物理破解 ABI 限制与脚本补丁
+      - name: 3. 破解 ABI 限制与脚本补丁
         run: |
-          cd kernel_workspace/kernel_platform
+          cd kernel_workspace
           echo "正在去除 GKI ABI 保护..."
           rm common/android/abi_gki_protected_exports_* || true
           
-          # 修复脚本内部的 process_list Bug
+          # 修复脚本内部的 process_list 变量缺失 Bug
           sed -i '/def __init__(self/a \        self.process_list = []' build_with_bazel.py
           
-          # 去除 -dirty 后缀
+          # 去除内核版本中的 -dirty 后缀
           for f in common/scripts/setlocalversion; do
             sed -i 's/ -dirty//g' "$f"
           done
 
       - name: 4. 执行核心编译 (SM8650 GKI)
         run: |
-          cd kernel_workspace/kernel_platform
-          # 设置工具链路径
-          export PATH=$(pwd)/../clang20/bin:$PATH
+          cd kernel_workspace
+          # 注入工具链路径到环境变量
+          export PATH=$(pwd)/clang20/bin:$PATH
           
-          # 执行编译。jobs=2 适配 GitHub 内存，--noshow_progress 减少日志大小
+          # 执行编译。--jobs=2 是为了防止 GitHub Actions 7GB 内存爆掉
+          # 如果依然报错 Exit Code 137(OOM)，请联系我改为 --jobs=1
           python3 build_with_bazel.py -t sm8650 gki --jobs=2
 
-      - name: 5. 封装 AnyKernel3
+      - name: 5. 提取产物并封装 AnyKernel3
         run: |
           cd kernel_workspace
           git clone https://github.com/osm0sis/AnyKernel3 nexus_ak3
           cd nexus_ak3
+          # 修改适配 init_boot 分区 (一加 Pad Pro 结构)
           sed -i 's/block=\/dev\/block\/tdb/block=\/dev\/block\/by-name\/init_boot/g' anykernel.sh
           sed -i 's/is_slot_device=0/is_slot_device=1/g' anykernel.sh
           
-          # 寻找编译好的 Image
-          IMAGE=$(find ../kernel_platform/out -name Image -type f | head -n 1)
+          # 在编译输出目录寻找生成的 Image 内核镜像
+          IMAGE=$(find ../out -name Image -type f | head -n 1)
           if [ -f "$IMAGE" ]; then
             cp "$IMAGE" .
-            zip -r9 ../Nexus_Kernel_Update.zip *
+            zip -r9 ../Nexus_Kernel_SM8650.zip *
           else
-            echo "错误：编译未生成 Image" && exit 1
+            echo "错误：未能在 out 目录找到编译产物 Image" && exit 1
           fi
 
-      - name: 6. 上传最终产物
+      - name: 6. 上传刷机包
         uses: actions/upload-artifact@v4
         with:
-          name: Oneplus-PadPro-Kernel
-          path: Nexus_Kernel_Update.zip
+          name: Nexus-SM8650-Kernel
+          path: Nexus_Kernel_SM8650.zip
