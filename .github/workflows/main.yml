@@ -21,7 +21,7 @@ jobs:
       - name: Build Advanced Rust Engine
         run: |
           mkdir -p src
-          # --- [Rust 源代码：集成 LKM 匹配逻辑] ---
+          # --- [Rust 源代码：修正 Nix 引用并加入 LKM 匹配] ---
           cat <<EOF > src/main.rs
           use nix::mount::{mount, MsFlags};
           use std::fs;
@@ -41,7 +41,7 @@ jobs:
               
               let _ = mount(Some("tmpfs"), tmp_base, Some("tmpfs"), MsFlags::empty(), Some("size=128M,mode=755"));
 
-              // 3. 扫描模块并拷贝挂载 (Mountify 核心逻辑)
+              // 3. 扫描模块并挂载
               let modules_root = Path::new("/data/adb/modules");
               if !modules_root.exists() { return Ok(()); }
 
@@ -60,42 +60,46 @@ jobs:
                       let target_dir = tmp_base.join(mod_id);
                       if !target_dir.exists() { let _ = fs::create_dir_all(&target_dir); }
 
-                      // 拷贝并镜像 SELinux 上下文
                       let _ = Command::new("cp").args(["-Lrf", sys_src.to_str().unwrap(), target_dir.to_str().unwrap()]).status();
                       let _ = Command::new("chcon").args(["--reference", "/system", target_dir.to_str().unwrap()]).status();
 
-                      // 执行挂载
                       let res = if mode.trim() == "overlay" {
                           let opts = format!("lowerdir={}", target_dir.display());
                           mount(Some("overlay"), "/system", Some("overlay"), MsFlags::empty(), Some(opts.as_str()))
                       } else {
                           mount(Some(target_dir.as_path()), "/system", None::<&str>, MsFlags::MS_BIND | MsFlags::MS_REC, Some("tmpfs"))
                       };
-
                       if res.is_ok() { mounted_list.push(mod_id.to_string()); }
                   }
               }
               let _ = fs::write("/data/adb/nexus_mounted.list", mounted_list.join("\n"));
 
-              // 4. LKM Nuke 自动识别与加载 (处理你上传的 .ko 文件)
-              let uts = nix::sys::utsname::uname().unwrap();
+              // 4. LKM Nuke 自动识别 (基于你上传的文件列表)
+              let uts = nix::sys::utsname::uname()?;
               let kernel = uts.release().to_str().unwrap();
-              let sdk = fs::read_to_string("/system/build.prop").unwrap_or_default();
               
+              // 匹配逻辑：优先匹配高版本
               let ko_name = if kernel.contains("6.6") { "nuke-android15-6.6.ko" }
                             else if kernel.contains("6.1") { "nuke-android14-6.1.ko" }
-                            else if kernel.contains("5.15") && sdk.contains("sdk_int=34") { "nuke-android14-5.15.ko" }
-                            else if kernel.contains("5.15") { "nuke-android13-5.15.ko" }
-                            else if kernel.contains("5.10") && sdk.contains("sdk_int=33") { "nuke-android13-5.10.ko" }
-                            else if kernel.contains("5.10") { "nuke-android12-5.10.ko" }
+                            else if kernel.contains("5.15") {
+                                // 5.15 内核区分 Android 14 和 13
+                                let sdk = fs::read_to_string("/system/build.prop").unwrap_or_default();
+                                if sdk.contains("ro.build.version.sdk=34") { "nuke-android14-5.15.ko" } else { "nuke-android13-5.15.ko" }
+                            }
+                            else if kernel.contains("5.10") {
+                                let sdk = fs::read_to_string("/system/build.prop").unwrap_or_default();
+                                if sdk.contains("ro.build.version.sdk=33") { "nuke-android13-5.10.ko" } else { "nuke-android12-5.10.ko" }
+                            }
                             else { "nuke-android-4.14.ko" };
 
               let ko_path = format!("/data/adb/modules/nexus_meta/lib/{}", ko_name);
-              // 寻找 ext4_unregister_sysfs 的符号地址
-              let kallsyms = fs::read_to_string("/proc/kallsyms").unwrap_or_default();
-              if let Some(line) = kallsyms.lines().find(|l| l.contains(" ext4_unregister_sysfs")) {
-                  if let Some(addr) = line.split_whitespace().next() {
-                      let _ = Command::new("insmod").arg(&ko_path).arg(format!("symaddr=0x{}", addr)).arg(format!("mount_point={}", fake_name)).status();
+              
+              // 获取符号地址并注入
+              if let Ok(kallsyms) = fs::read_to_string("/proc/kallsyms") {
+                  if let Some(line) = kallsyms.lines().find(|l| l.contains(" ext4_unregister_sysfs")) {
+                      if let Some(addr) = line.split_whitespace().next() {
+                          let _ = Command::new("insmod").arg(&ko_path).arg(format!("symaddr=0x{}", addr)).arg(format!("mount_point={}", fake_name)).status();
+                      }
                   }
               }
 
@@ -103,13 +107,14 @@ jobs:
           }
           EOF
 
+          # --- [Cargo.toml: 开启 uts 特性] ---
           cat <<EOF > Cargo.toml
           [package]
           name = "ksu_meta_engine"
-          version = "7.0.0"
+          version = "7.0.1"
           edition = "2021"
           [dependencies]
-          nix = { version = "0.27.1", features = ["mount", "fs"] }
+          nix = { version = "0.27.1", features = ["mount", "fs", "user", "feature"] }
           [[bin]]
           name = "ksu_meta_engine"
           path = "src/main.rs"
@@ -124,43 +129,43 @@ jobs:
         run: |
           mkdir -p build/bin build/webroot build/lib build/META-INF/com/google/android
           
-          # 1. 复制你上传的所有 .ko 文件到 lib 目录 (假设它们在根目录)
-          cp nuke-android*.ko build/lib/
+          # 拷贝所有 LKM 模块
+          cp nuke-android*.ko build/lib/ 2>/dev/null || true
           
-          # 2. 写入模块属性
           cat <<EOF > build/module.prop
           id=nexus_meta
           name=Nexus Meta (LKM Nuke Edition)
-          version=v7.0.0
-          versionCode=700
+          version=v7.0.1
+          versionCode=701
           author=Gemini
-          description=全量元引擎：自动识别内核并载入 LKM Nuke 抹除挂载特征。支持 tmpfs 镜像挂载。
+          description=全量元引擎：自动匹配 LKM Nuke 抹除挂载特征。
           metamodule=1
           EOF
 
-          # 3. WebUI 界面
           cat <<EOF > build/webroot/index.html
           <!DOCTYPE html><html><head><meta charset="UTF-8"><link rel="stylesheet" href="/internal/insets.css">
-          <style>body{font-family:sans-serif;padding:20px;background:#f5f5f7} .card{background:#fff;padding:20px;border-radius:15px;box-shadow:0 8px 16px rgba(0,0,0,0.05);margin-bottom:20px}
+          <style>body{font-family:sans-serif;padding:20px;background:#f5f5f7}.card{background:#fff;padding:20px;border-radius:15px;box-shadow:0 8px 16px rgba(0,0,0,0.05);margin-bottom:20px}
           button{width:100%;padding:14px;background:#007aff;color:#fff;border:none;border-radius:10px;font-weight:600}</style></head>
-          <body><div class="card"><h3>内核保护状态</h3><p id="kver">正在获取内核版本...</p>
-          <button onclick="save()">重载元引擎</button></div>
+          <body><div class="card"><h3>内核保护</h3><p id="kver">探测中...</p>
+          <button onclick="save()">触发全量元挂载</button></div>
           <script type="module">import { exec, toast } from 'https://mui.kernelsu.org/lib/kernelsu.js';
-          window.save=async()=>{ toast('正在通过 Rust 引擎重载...'); await exec('/data/adb/modules/nexus_meta/bin/ksu_meta_engine'); };
-          const {stdout}=await exec('uname -r'); document.getElementById('kver').innerText='内核: '+stdout;
+          window.save=async()=>{ toast('正在执行挂载并清理节点...'); await exec('/data/adb/modules/nexus_meta/bin/ksu_meta_engine'); };
+          const {stdout}=await exec('uname -r'); document.getElementById('kver').innerText='内核版本: '+stdout;
           </script></body></html>
           EOF
 
-          # 4. 关键挂载脚本
           cat <<EOF > build/metamount.sh
           #!/system/bin/sh
           MODDIR="\${0%/*}"
-          # 禁用常规挂载
           for m in /data/adb/modules/*; do [ -d "\$m/system" ] && [ "\$m" != "\$MODDIR" ] && touch "\$m/skip_mount"; done
           \$MODDIR/bin/ksu_meta_engine
           EOF
 
-          # 5. 安装程序引导 (#MAGISK 规范)
+          # 创建必要脚本
+          for s in post-fs-data.sh service.sh boot-completed.sh metainstall.sh metauninstall.sh customize.sh uninstall.sh; do
+            echo "#!/system/bin/sh" > "build/\$s"
+          done
+
           echo "#MAGISK" > build/META-INF/com/google/android/updater-script
           cat <<EOF > build/META-INF/com/google/android/update-binary
           #!/sbin/sh
